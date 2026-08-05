@@ -669,6 +669,9 @@ struct ContentView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             DebugLogger.shared.info("🚦 Startup delay complete, signaling UI ready...", source: "ContentView")
             self.appServices.signalUIReady()
+            self.menuBarManager.configure(
+                meetingCoordinator: self.appServices.meetingSessionCoordinator
+            )
 
             Task { @MainActor in
                 await AudioStartupGate.shared.scheduleOpenAfterInitialUISettled()
@@ -1059,6 +1062,10 @@ struct ContentView: View {
             self.openSettings(.audio)
         case .settings:
             self.openSettings(.general)
+        case .meetingTranscription:
+            self.navigateToApp(.meetingTools)
+        case .preferences:
+            self.openSettings(.general)
         }
     }
 
@@ -1316,7 +1323,12 @@ struct ContentView: View {
 
             Section {
                 self.sidebarNavigationLink(.commandMode, title: "Command Mode", systemImage: "terminal.fill")
-                self.sidebarNavigationLink(.meetingTools, title: "File Transcription", systemImage: "doc.text.fill")
+                self.sidebarNavigationLink(.fileTranscription, title: "File Transcription", systemImage: "doc.text.fill")
+                self.sidebarNavigationLink(
+                    .meetingTranscription,
+                    title: "Meeting Transcription",
+                    systemImage: "person.2.wave.2.fill"
+                )
             } header: {
                 self.sidebarSectionHeader("Use")
             }
@@ -1912,10 +1924,21 @@ struct ContentView: View {
         })
     }
 
-    // MARK: - Meeting Transcription (Coming Soon)
+    // MARK: - File and Meeting Transcription
 
-    private var meetingToolsView: some View {
-        MeetingTranscriptionView(asrService: self.asr)
+    private var fileTranscriptionView: some View {
+        FileTranscriptionView(
+            asrService: self.asr,
+            transcriptionService: self.appServices.fileTranscriptionService
+        )
+    }
+
+    private var meetingTranscriptionView: some View {
+        MeetingTranscriptionView(
+            coordinator: self.appServices.meetingSessionCoordinator,
+            asrService: self.asr,
+            onOpenVoiceEngine: { self.selectedSidebarItem = .voiceEngine }
+        )
     }
 
     // MARK: - Stats View
@@ -3913,6 +3936,7 @@ struct ContentView: View {
 
     /// Capture app context at start to avoid mismatches if the user switches apps mid-session
     private func startRecording() {
+        guard !self.presentExclusiveActivityBlockIfNeeded() else { return }
         let model = SettingsStore.shared.selectedSpeechModel
         DebugLogger.shared.info(
             "ContentView: startRecording() for model=\(model.displayName), supportsStreaming=\(model.supportsStreaming)",
@@ -3922,7 +3946,6 @@ struct ContentView: View {
             DebugLogger.shared.debug("ContentView: start ignored because capture is already active", source: "ContentView")
             return
         }
-
         self.advanceOverlayLifecycle()
         self.setActiveRecordingMode(.dictate)
         let shouldShowDictationOverlay = !self.isRecordingForCommand
@@ -3971,6 +3994,20 @@ struct ContentView: View {
                 DebugLogger.shared.error("Failed to pre-load model: \(error)", source: "ContentView")
             }
         }
+    }
+
+    private func presentExclusiveActivityBlockIfNeeded() -> Bool {
+        guard let activity = self.asr.activeExclusiveActivity else { return false }
+        let message = "Wait for the active \(activity.displayName) to finish."
+        self.asr.errorTitle = "Dictation Unavailable"
+        self.asr.errorMessage = message
+        self.asr.showError = true
+        AccessibilityNotification.Announcement("Dictation unavailable. \(message)").post()
+        DebugLogger.shared.info(
+            "ContentView: dictation start blocked by \(activity.rawValue)",
+            source: "ContentView"
+        )
+        return true
     }
 
     private func prewarmPrivateAIDictationIfNeeded(for slot: SettingsStore.DictationShortcutSlot) {
@@ -4192,6 +4229,7 @@ struct ContentView: View {
                 self.beginDictationRecording(for: selection, mode: .promptMode)
             },
             commandModeCallback: {
+                guard !self.presentExclusiveActivityBlockIfNeeded() else { return }
                 DebugLogger.shared.info("Command mode triggered", source: "ContentView")
                 self.captureRecordingContext()
 
@@ -4223,6 +4261,9 @@ struct ContentView: View {
                 }
             },
             rewriteModeCallback: {
+                guard !self.presentExclusiveActivityBlockIfNeeded() else { return }
+                guard !self.showPrivateAIEditModeUnavailableIfNeeded() else { return }
+
                 self.captureRecordingContext()
 
                 // Try to capture text first while still in the other app
@@ -4580,6 +4621,7 @@ extension ContentView {
         mode: ActiveRecordingMode,
         startMethod: AnalyticsOnboardingTryoutStartMethod = .hotkey
     ) {
+        guard !self.presentExclusiveActivityBlockIfNeeded() else { return }
         DebugLogger.shared.debug("Begin dictation recording for slot \(slot.rawValue)", source: "ContentView")
         self.appBench("begin_recording slot=\(slot.rawValue) mode=\(mode.rawValue)")
         if self.isOnboardingVoicePlaygroundStepActive {

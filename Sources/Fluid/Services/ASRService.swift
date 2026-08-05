@@ -357,6 +357,45 @@ enum ASRStopOutcome: Equatable {
     case failed
 }
 
+enum ASRExclusiveActivity: String, Equatable {
+    case dictation
+    case fileTranscription
+    case localAPI
+    case meeting
+    case modelMaintenance
+
+    var displayName: String {
+        switch self {
+        case .dictation:
+            return "dictation"
+        case .fileTranscription:
+            return "file transcription"
+        case .localAPI:
+            return "local API transcription"
+        case .meeting:
+            return "meeting transcription"
+        case .modelMaintenance:
+            return "voice model maintenance"
+        }
+    }
+}
+
+struct ASRActivityLease: Equatable {
+    let id: UUID
+    let activity: ASRExclusiveActivity
+}
+
+enum ASRActivityError: LocalizedError {
+    case activityInProgress(ASRExclusiveActivity)
+
+    var errorDescription: String? {
+        switch self {
+        case let .activityInProgress(activity):
+            return "Wait for the active \(activity.displayName) to finish."
+        }
+    }
+}
+
 // swiftlint:disable file_length type_body_length
 /// A comprehensive speech recognition service that handles real-time audio transcription.
 ///
@@ -519,9 +558,39 @@ final class ASRService: ObservableObject {
     private(set) var dictionaryTrainingAudioGeneration = 0
 
     @Published private(set) var isStarting: Bool = false // Guard against re-entrant start() calls
+    @Published private(set) var activeExclusiveActivity: ASRExclusiveActivity?
     private var audioCaptureStartWaiters: [CheckedContinuation<Void, Never>] = []
+    private var activeActivityLease: ASRActivityLease?
+    private var dictationActivityLease: ASRActivityLease?
+    private var providerResetPending = false
     var isRunningOrStarting: Bool {
         self.isRunning || self.isStarting
+    }
+
+    func acquireExclusiveActivity(_ activity: ASRExclusiveActivity) throws -> ASRActivityLease {
+        guard let activeActivityLease = self.activeActivityLease else {
+            let lease = ASRActivityLease(id: UUID(), activity: activity)
+            self.activeActivityLease = lease
+            self.activeExclusiveActivity = activity
+            return lease
+        }
+        throw ASRActivityError.activityInProgress(activeActivityLease.activity)
+    }
+
+    func releaseExclusiveActivity(_ lease: ASRActivityLease) {
+        guard self.activeActivityLease == lease else { return }
+        self.activeActivityLease = nil
+        self.activeExclusiveActivity = nil
+
+        guard self.providerResetPending else { return }
+        self.providerResetPending = false
+        self.resetTranscriptionProvider()
+    }
+
+    private func releaseDictationActivityIfNeeded() {
+        guard let lease = self.dictationActivityLease else { return }
+        self.dictationActivityLease = nil
+        self.releaseExclusiveActivity(lease)
     }
 
     private let audioCaptureReadinessGate = AudioCaptureReadinessGate()
@@ -927,6 +996,20 @@ final class ASRService: ObservableObject {
             self.resetProviderAfterStreamingRecovery = true
             return
         }
+
+        guard self.activeActivityLease == nil else {
+            self.providerResetPending = true
+            DebugLogger.shared.info(
+                "ASRService: Deferring provider reset until \(self.activeExclusiveActivity?.displayName ?? "active work") finishes",
+                source: "ASRService"
+            )
+            return
+        }
+
+        guard let resetLease = try? self.acquireExclusiveActivity(.modelMaintenance) else {
+            self.providerResetPending = true
+            return
+        }
         let newModel = SettingsStore.shared.selectedSpeechModel
         DebugLogger.shared.info("ASRService: Switching to '\(newModel.displayName)', resetting provider state...", source: "ASRService")
 
@@ -971,6 +1054,7 @@ final class ASRService: ObservableObject {
         // Use Task for async check to support providers like AppleSpeechAnalyzerProvider
         Task { [weak self] in
             guard let self = self else { return }
+            defer { self.releaseExclusiveActivity(resetLease) }
             _ = await retiringTask?.result
             guard SettingsStore.shared.selectedSpeechModel == newModel else { return }
             await self.checkIfModelsExistAsync()
@@ -2076,6 +2160,16 @@ final class ASRService: ObservableObject {
             DebugLogger.shared.warning("START() blocked - app is terminating", source: "ASRService")
             return .failed
         }
+        do {
+            self.dictationActivityLease = try self.acquireExclusiveActivity(.dictation)
+        } catch {
+            let message = error.localizedDescription
+            self.errorTitle = "Dictation Unavailable"
+            self.errorMessage = message
+            self.showError = true
+            DebugLogger.shared.warning("START() blocked - \(message)", source: "ASRService")
+            return .failed
+        }
         self.audioCaptureStartGeneration &+= 1
         let startGeneration = self.audioCaptureStartGeneration
         self.isStarting = true
@@ -2121,6 +2215,7 @@ final class ASRService: ObservableObject {
                 "Audio capture start cancelled during route handoff generation=\(startGeneration)",
                 source: "ASRService"
             )
+            self.releaseDictationActivityIfNeeded()
             return .failed
         }
 
@@ -2401,6 +2496,7 @@ final class ASRService: ObservableObject {
             DebugLogger.shared.info("✅ START() completed successfully", source: "ASRService")
             return .started
         } catch {
+            self.releaseDictationActivityIfNeeded()
             await self.audioCaptureReadinessGate.cancel(
                 sessionID: captureSessionID,
                 attemptID: readinessAttemptID
@@ -2715,6 +2811,7 @@ final class ASRService: ObservableObject {
         }
         guard self.isRunning else {
             self.isDictionaryTrainingCaptureActive = false
+            self.releaseDictationActivityIfNeeded()
             DebugLogger.shared.warning("⚠️ STOP() - not running, returning empty string", source: "ASRService")
             return ""
         }
@@ -2740,6 +2837,7 @@ final class ASRService: ObservableObject {
         defer {
             self.applyPendingParakeetVocabularyReloadIfNeeded()
             self.isDictionaryTrainingCaptureActive = false
+            self.releaseDictationActivityIfNeeded()
         }
 
         await self.cancelAudioRouteRecoveryAndWait()
@@ -3142,6 +3240,12 @@ final class ASRService: ObservableObject {
     }
 
     func transcribeSamplesForAPI(_ inputSamples: [Float]) async throws -> ASRTranscriptionResult {
+        let lease = try self.acquireExclusiveActivity(.localAPI)
+        defer { self.releaseExclusiveActivity(lease) }
+        return try await self.transcribeSamplesForAPIWithLease(inputSamples)
+    }
+
+    private func transcribeSamplesForAPIWithLease(_ inputSamples: [Float]) async throws -> ASRTranscriptionResult {
         var samples = inputSamples
         guard !samples.isEmpty else {
             return ASRTranscriptionResult(text: "", confidence: 0)
@@ -3179,6 +3283,8 @@ final class ASRService: ObservableObject {
     }
 
     func transcribeFileForAPI(_ fileURL: URL) async throws -> (result: ASRTranscriptionResult, sampleCount: Int) {
+        let lease = try self.acquireExclusiveActivity(.localAPI)
+        defer { self.releaseExclusiveActivity(lease) }
         guard FileManager.default.isReadableFile(atPath: fileURL.path) else {
             throw NSError(
                 domain: "ASRService",
@@ -3275,11 +3381,42 @@ final class ASRService: ObservableObject {
         return (ASRTranscriptionResult(text: cleanedText, confidence: result.confidence), estimatedSamples)
     }
 
+    func transcribeMeetingSamples(
+        _ samples: [Float],
+        provider: any TranscriptionProvider,
+        languageCode: String
+    ) async throws -> ASRTranscriptionResult {
+        guard self.activeExclusiveActivity == .meeting else {
+            throw ASRActivityError.activityInProgress(self.activeExclusiveActivity ?? .meeting)
+        }
+        return try await self.transcriptionExecutor.run { [provider] in
+            if let whisperProvider = provider as? WhisperProvider {
+                return try await whisperProvider.transcribe(samples, languageCode: languageCode)
+            }
+            return try await provider.transcribe(samples)
+        }
+    }
+
+    func transcribeMeetingFile(
+        at fileURL: URL,
+        provider: any TranscriptionProvider
+    ) async throws -> ASRTranscriptionResult {
+        guard self.activeExclusiveActivity == .meeting else {
+            throw ASRActivityError.activityInProgress(self.activeExclusiveActivity ?? .meeting)
+        }
+        return try await self.transcriptionExecutor.run { [provider] in
+            try await provider.transcribeFile(at: fileURL)
+        }
+    }
+
     func stopWithoutTranscription() async {
         if self.isStarting, self.isRunning == false {
             await self.cancelPendingAudioCaptureStart(reason: "stop_without_transcription")
         }
-        guard self.isRunning else { return }
+        guard self.isRunning else {
+            self.releaseDictationActivityIfNeeded()
+            return
+        }
         let stoppingSessionID = self.benchmarkSessionID
         guard let bufferHandoffToken = self.recordingBufferHandoffGate.begin() else { return }
         var completedBufferHandoff = false
@@ -3292,6 +3429,7 @@ final class ASRService: ObservableObject {
         defer {
             self.applyPendingParakeetVocabularyReloadIfNeeded()
             self.isDictionaryTrainingCaptureActive = false
+            self.releaseDictationActivityIfNeeded()
         }
 
         await self.cancelAudioRouteRecoveryAndWait()
@@ -5150,6 +5288,8 @@ final class ASRService: ObservableObject {
 
     func clearModelCache() async throws {
         try self.requireStreamingProviderAvailable()
+        let activityLease = try self.acquireExclusiveActivity(.modelMaintenance)
+        defer { self.releaseExclusiveActivity(activityLease) }
         DebugLogger.shared.debug("Clearing model cache via transcription provider", source: "ASRService")
         self.streamingWorkState.invalidateProvider()
         self.isAsrReady = false
@@ -5160,6 +5300,8 @@ final class ASRService: ObservableObject {
 
     func clearModelCache(for model: SettingsStore.SpeechModel) async throws {
         try self.requireStreamingProviderAvailable()
+        let activityLease = try self.acquireExclusiveActivity(.modelMaintenance)
+        defer { self.releaseExclusiveActivity(activityLease) }
         DebugLogger.shared.debug("Clearing model cache for \(model.displayName)", source: "ASRService")
         if SettingsStore.shared.selectedSpeechModel == model {
             self.streamingWorkState.invalidateProvider()
@@ -5174,8 +5316,7 @@ final class ASRService: ObservableObject {
         }
 
         guard SettingsStore.shared.selectedSpeechModel == model else { return }
-        self.resetTranscriptionProvider()
-        await self.checkIfModelsExistAsync()
+        self.providerResetPending = true
     }
 
     // MARK: - Timer-based Streaming Transcription (No VAD)
