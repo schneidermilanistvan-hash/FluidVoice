@@ -64,6 +64,8 @@ struct SettingsBackupPayload: Codable, Equatable {
     let showHistoryPerformanceMetrics: Bool?
     // Optional so backups created before the silence filter still decode.
     let skipSilentRecordingsEnabled: Bool?
+    // Optional so backups created before Phase 3 voice-processing capture still decode.
+    let meetingVPIOMicCapture: Bool?
     let enableAIStreaming: Bool
     let copyTranscriptionToClipboard: Bool
     let textInsertionMode: SettingsStore.TextInsertionMode
