@@ -1063,7 +1063,7 @@ struct ContentView: View {
         case .settings:
             self.openSettings(.general)
         case .meetingTranscription:
-            self.navigateToApp(.meetingTools)
+            self.navigateToApp(.meetingTranscription)
         case .preferences:
             self.openSettings(.general)
         }
@@ -1078,7 +1078,7 @@ struct ContentView: View {
         case .history:
             self.navigateToApp(.history)
         case .meetingTranscription:
-            self.navigateToApp(.meetingTools)
+            self.navigateToApp(.meetingTranscription)
         }
     }
 
@@ -1661,8 +1661,10 @@ struct ContentView: View {
                 activeShortcutRecordingTarget: self.$activeShortcutRecordingTarget,
                 shortcutRecordingMessage: self.$shortcutRecordingMessage
             ))
-        case .meetingTools:
-            return AnyView(self.meetingToolsView)
+        case .fileTranscription:
+            return AnyView(self.fileTranscriptionView)
+        case .meetingTranscription:
+            return AnyView(self.meetingTranscriptionView)
         case .customDictionary:
             return AnyView(CustomDictionaryView())
         case .stats:
