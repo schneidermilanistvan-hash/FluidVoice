@@ -325,13 +325,18 @@ final class MeetingMicrophoneCaptureTests: XCTestCase {
         return (writer, sessionDirectory)
     }
 
-    private func pushBuffer(_ writer: MeetingAudioChunkWriter, ptsSeconds: Double, frameCount: Int = 480) {
+    private func pushBuffer(
+        _ writer: MeetingAudioChunkWriter,
+        ptsSeconds: Double,
+        frameCount: Int = 480,
+        producerEpoch: UInt64 = 0
+    ) {
         let buffer = self.makeMonoBuffer(frameCount: frameCount) { _ in 0.1 }
         let pts = CMTime(seconds: ptsSeconds, preferredTimescale: 48_000)
         guard let sampleBuffer = meetingMicrophoneSynthesizeSampleBuffer(from: buffer, presentationTime: pts) else {
             return XCTFail("failed to synthesize a sample buffer")
         }
-        writer.enqueue(sampleBuffer)
+        writer.enqueue(sampleBuffer, producerEpoch: producerEpoch)
     }
 
     func testSteadySequenceProducesOneChunkWithNoDiscontinuities() async throws {
@@ -360,6 +365,52 @@ final class MeetingMicrophoneCaptureTests: XCTestCase {
 
         XCTAssertEqual(track.chunks.count, 2)
         XCTAssertEqual(track.chunks.first?.discontinuities.map(\.kind), [.clockDiscontinuity])
+    }
+
+    func testLargeBackwardJumpIsRetimedAndNeverProducesInvalidChunkBounds() async throws {
+        let (writer, sessionDirectory) = try self.makeWriter()
+        defer { try? FileManager.default.removeItem(at: sessionDirectory) }
+
+        self.pushBuffer(writer, ptsSeconds: 100, producerEpoch: 1)
+        self.pushBuffer(writer, ptsSeconds: 1, producerEpoch: 1)
+        let track = await writer.stop()
+
+        XCTAssertEqual(track.chunks.count, 2)
+        XCTAssertTrue(track.chunks.allSatisfy { $0.presentationEnd.seconds >= $0.presentationStart.seconds })
+        XCTAssertEqual(track.chunks[1].presentationStart.seconds, 100.01, accuracy: 1.0 / 48_000)
+        XCTAssertEqual(track.chunks[0].discontinuities.map(\.kind), [.clockDiscontinuity])
+    }
+
+    func testNewProducerEpochCreatesMonotonicBoundaryAcrossClockReset() async throws {
+        let (writer, sessionDirectory) = try self.makeWriter()
+        defer { try? FileManager.default.removeItem(at: sessionDirectory) }
+
+        self.pushBuffer(writer, ptsSeconds: 42, producerEpoch: 7)
+        self.pushBuffer(writer, ptsSeconds: 0, producerEpoch: 8)
+        self.pushBuffer(writer, ptsSeconds: 0.01, producerEpoch: 8)
+        self.pushBuffer(writer, ptsSeconds: 0.02, producerEpoch: 8)
+        let track = await writer.stop()
+
+        XCTAssertEqual(track.chunks.count, 2)
+        XCTAssertTrue(track.chunks.allSatisfy { $0.presentationEnd.seconds >= $0.presentationStart.seconds })
+        XCTAssertEqual(track.chunks[1].presentationStart.seconds, 42.01, accuracy: 1.0 / 48_000)
+        XCTAssertEqual(track.chunks[1].presentationEnd.seconds, 42.04, accuracy: 1.0 / 48_000)
+        XCTAssertEqual(track.chunks[0].discontinuities.first?.detail, "Capture producer epoch changed.")
+    }
+
+    func testRetiredProducerEpochIsDroppedInsteadOfRetimedAsDuplicateAudio() async throws {
+        let (writer, sessionDirectory) = try self.makeWriter()
+        defer { try? FileManager.default.removeItem(at: sessionDirectory) }
+
+        self.pushBuffer(writer, ptsSeconds: 10, producerEpoch: 1)
+        self.pushBuffer(writer, ptsSeconds: 0, producerEpoch: 2)
+        self.pushBuffer(writer, ptsSeconds: 20, producerEpoch: 1)
+        let track = await writer.stop()
+
+        XCTAssertEqual(track.health.droppedSampleCount, 1)
+        XCTAssertEqual(track.chunks.count, 2)
+        XCTAssertLessThan(track.chunks.last?.presentationEnd.seconds ?? .infinity, 11)
+        XCTAssertTrue(track.chunks.allSatisfy { $0.presentationEnd.seconds >= $0.presentationStart.seconds })
     }
 
     func testFortyNineMillisecondGapDoesNotRotate() async throws {
@@ -794,6 +845,36 @@ extension MeetingMicrophoneCaptureTests {
         let elected = MeetingCaptureDeviceElection.decide(original: original, catalog: catalog, defaultInputUID: "uid-2")
         XCTAssertEqual(elected.identity.captureDeviceID, "dev-2")
         XCTAssertEqual(elected.role, .unknown)
+    }
+
+    func testDeviceTransitionDistinguishesUnchangedChangedAndUnavailable() {
+        let builtIn = self.micIdentity(id: "dev-1", uid: "uid-1", name: "MacBook Mic")
+        let headset = self.micIdentity(id: "dev-2", uid: "uid-2", name: "Headset Mic")
+
+        XCTAssertEqual(
+            MeetingCaptureDeviceElection.decideTransition(
+                from: builtIn, catalog: [builtIn, headset], defaultInputUID: "uid-1"
+            ),
+            .unchanged(MeetingCaptureDeviceElection(identity: builtIn, role: .unknown))
+        )
+        XCTAssertEqual(
+            MeetingCaptureDeviceElection.decideTransition(
+                from: builtIn, catalog: [builtIn, headset], defaultInputUID: "uid-2"
+            ),
+            .changed(MeetingCaptureDeviceElection(identity: headset, role: .unknown))
+        )
+        XCTAssertEqual(
+            MeetingCaptureDeviceElection.decideTransition(
+                from: builtIn, catalog: [builtIn], defaultInputUID: nil
+            ),
+            .unavailable
+        )
+        XCTAssertEqual(
+            MeetingCaptureDeviceElection.decideTransition(
+                from: builtIn, catalog: [builtIn], defaultInputUID: "stale-default"
+            ),
+            .unavailable
+        )
     }
 
     func testElectionFallsBackToOriginalIdentityWithUnknownRoleWhenNoSystemDefault() {

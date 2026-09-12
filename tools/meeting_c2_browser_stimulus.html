@@ -12,11 +12,11 @@
 </style>
 <h1>FluidVoice C2 diagnostic stimulus</h1>
 <p>
-  A deterministic 12-second, low-level sweep and speech-like tone for the selected-application
+  A deterministic 24-second, low-level broadband calibration signal for the selected-application
   ScreenCaptureKit probe. No microphone or user data is read by this page.
 </p>
 <p>Browser master gain: <code>0.08</code>. FluidVoice still performs its own route checks.</p>
-<button id="start" type="button">Start 12-second diagnostic</button>
+<button id="start" type="button">Start 24-second diagnostic</button>
 <div id="status" role="status">Ready.</div>
 <script>
   const button = document.querySelector('#start');
@@ -28,53 +28,59 @@
     // intentionally PLAYING only after this user gesture has resumed the AudioContext.
     const context = new AudioContext({ sampleRate: 48000 });
     await context.resume();
-    document.title = 'FluidVoice C2 Diagnostic Stimulus — PLAYING';
+    const durationSeconds = 24;
+    document.title = `FluidVoice C2 Diagnostic Stimulus — PLAYING — ${durationSeconds}s`;
     const t0 = context.currentTime + 0.20;
     const master = context.createGain();
     master.gain.setValueAtTime(0.08, t0);
     master.connect(context.destination);
 
-    const sweep = context.createOscillator();
-    const sweepGain = context.createGain();
-    sweep.type = 'sine';
-    sweep.frequency.setValueAtTime(180, t0 + 0.50);
-    sweep.frequency.exponentialRampToValueAtTime(7800, t0 + 3.50);
-    sweepGain.gain.setValueAtTime(0, t0);
-    sweepGain.gain.setValueAtTime(0, t0 + 0.50);
-    sweepGain.gain.linearRampToValueAtTime(0.45, t0 + 0.55);
-    sweepGain.gain.setValueAtTime(0.45, t0 + 3.45);
-    sweepGain.gain.linearRampToValueAtTime(0, t0 + 3.50);
-    sweep.connect(sweepGain).connect(master);
-    sweep.start(t0);
-    sweep.stop(t0 + 3.55);
+    const calibration = context.createGain();
+    calibration.gain.setValueAtTime(0, t0);
+    calibration.gain.linearRampToValueAtTime(1, t0 + 0.25);
+    calibration.gain.setValueAtTime(1, t0 + 22.25);
+    calibration.gain.linearRampToValueAtTime(0, t0 + 22.50);
+    calibration.connect(master);
 
-    const voiced = context.createOscillator();
-    const voicedGain = context.createGain();
-    voiced.type = 'sawtooth';
-    voiced.frequency.setValueAtTime(115, t0 + 4.00);
-    voiced.frequency.linearRampToValueAtTime(145, t0 + 10.50);
-    voicedGain.gain.setValueAtTime(0, t0);
-    voicedGain.gain.setValueAtTime(0, t0 + 4.00);
-    for (let i = 0; i < 26; i++) {
-      const start = t0 + 4.00 + i * 0.25;
-      voicedGain.gain.linearRampToValueAtTime(0.28, start + 0.04);
-      voicedGain.gain.linearRampToValueAtTime(0.10, start + 0.19);
-      voicedGain.gain.linearRampToValueAtTime(0, start + 0.24);
+    // Seeded broadband noise makes the delay peak identifiable across every analysis window.
+    const frameCount = Math.ceil(context.sampleRate * 22.50);
+    const noiseBuffer = context.createBuffer(1, frameCount, context.sampleRate);
+    const samples = noiseBuffer.getChannelData(0);
+    let state = 0x6d2b79f5;
+    for (let i = 0; i < samples.length; i++) {
+      state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+      samples[i] = ((state / 0xffffffff) * 2 - 1) * 0.18;
     }
-    voiced.connect(voicedGain).connect(master);
-    voiced.start(t0);
-    voiced.stop(t0 + 10.55);
+    const noise = context.createBufferSource();
+    noise.buffer = noiseBuffer;
+    noise.connect(calibration);
+    noise.start(t0);
+    noise.stop(t0 + 22.50);
+
+    // Fixed tones keep every registered analysis band above its excitation floor.
+    for (const frequency of [250, 500, 750, 1000, 1500, 2500, 4000, 6000]) {
+      const oscillator = context.createOscillator();
+      const gain = context.createGain();
+      oscillator.type = 'sine';
+      oscillator.frequency.setValueAtTime(frequency, t0);
+      gain.gain.setValueAtTime(0.05, t0);
+      oscillator.connect(gain).connect(calibration);
+      oscillator.start(t0);
+      oscillator.stop(t0 + 22.50);
+    }
 
     const ticks = [];
-    for (let remaining = 12; remaining >= 1; remaining--) {
-      ticks.push(setTimeout(() => { status.textContent = `Playing: ${remaining}s remaining`; },
-                            (12 - remaining) * 1000));
+    for (let remaining = durationSeconds; remaining >= 1; remaining--) {
+      ticks.push(setTimeout(() => {
+        document.title = `FluidVoice C2 Diagnostic Stimulus — PLAYING — ${remaining}s`;
+        status.textContent = `Playing: ${remaining}s remaining`;
+      }, (durationSeconds - remaining) * 1000));
     }
     setTimeout(async () => {
       status.textContent = 'Complete.';
       document.title = 'FluidVoice C2 Diagnostic Stimulus — COMPLETE';
       await context.close();
       button.disabled = false;
-    }, 12000);
+    }, durationSeconds * 1000);
   });
 </script>

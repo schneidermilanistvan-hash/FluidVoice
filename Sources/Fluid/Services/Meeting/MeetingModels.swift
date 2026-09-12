@@ -371,6 +371,9 @@ nonisolated enum MeetingAudioTrackCaptureMethod: String, Codable, Sendable {
 nonisolated enum MeetingMicrophoneEchoProtection: String, Codable, Sendable {
     case voiceProcessed
     case acousticallyClosed
+    /// Microphone PCM processed by the pinned WebRTC AEC3 bridge after clock attestation and
+    /// warm-up. This is software provenance, not a claim that the physical route is closed.
+    case softwareEchoCancelled
     /// Pre-v9 audio that was historically transcribed without route evidence. It remains eligible
     /// for backward compatibility, but must never be rewritten as positively verified protection.
     case legacyUnclassified
@@ -379,6 +382,13 @@ nonisolated enum MeetingMicrophoneEchoProtection: String, Codable, Sendable {
     var admitsTranscript: Bool {
         self != .unprotected
     }
+}
+
+nonisolated struct MeetingAECProvenance: Codable, Equatable, Sendable {
+    var upstreamRevision: String
+    var bridgeConfigurationID: String
+    var sampleRateHz: Int
+    var frameDurationMilliseconds: Int
 }
 
 nonisolated struct MeetingClockDriftRecord: Codable, Equatable, Sendable {
@@ -397,10 +407,11 @@ nonisolated struct MeetingCaptureEra: Codable, Equatable, Sendable {
     var startSeconds: Double
     var settledConfig: MeetingMicrophoneSettledConfig? = nil
     var clockDrift: MeetingClockDriftRecord? = nil
+    var aecProvenance: MeetingAECProvenance? = nil
 
     private enum CodingKeys: String, CodingKey {
         case method, deviceUID, deviceName, roleAtElection, echoProtection
-        case startSeconds, settledConfig, clockDrift
+        case startSeconds, settledConfig, clockDrift, aecProvenance
     }
 
     init(
@@ -411,7 +422,8 @@ nonisolated struct MeetingCaptureEra: Codable, Equatable, Sendable {
         echoProtection: MeetingMicrophoneEchoProtection = .unprotected,
         startSeconds: Double,
         settledConfig: MeetingMicrophoneSettledConfig? = nil,
-        clockDrift: MeetingClockDriftRecord? = nil
+        clockDrift: MeetingClockDriftRecord? = nil,
+        aecProvenance: MeetingAECProvenance? = nil
     ) {
         self.method = method
         self.deviceUID = deviceUID
@@ -421,6 +433,7 @@ nonisolated struct MeetingCaptureEra: Codable, Equatable, Sendable {
         self.startSeconds = startSeconds
         self.settledConfig = settledConfig
         self.clockDrift = clockDrift
+        self.aecProvenance = aecProvenance
     }
 
     init(from decoder: Decoder) throws {
@@ -441,6 +454,7 @@ nonisolated struct MeetingCaptureEra: Codable, Equatable, Sendable {
         self.startSeconds = try container.decode(Double.self, forKey: .startSeconds)
         self.settledConfig = try container.decodeIfPresent(MeetingMicrophoneSettledConfig.self, forKey: .settledConfig)
         self.clockDrift = try container.decodeIfPresent(MeetingClockDriftRecord.self, forKey: .clockDrift)
+        self.aecProvenance = try container.decodeIfPresent(MeetingAECProvenance.self, forKey: .aecProvenance)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -453,6 +467,7 @@ nonisolated struct MeetingCaptureEra: Codable, Equatable, Sendable {
         try container.encode(self.startSeconds, forKey: .startSeconds)
         try container.encodeIfPresent(self.settledConfig, forKey: .settledConfig)
         try container.encodeIfPresent(self.clockDrift, forKey: .clockDrift)
+        try container.encodeIfPresent(self.aecProvenance, forKey: .aecProvenance)
     }
 }
 

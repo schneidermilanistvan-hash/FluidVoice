@@ -9,6 +9,7 @@ let package = Package(
         .macOS("15.0"),
     ],
     dependencies: [
+        .package(path: "Vendor/WebRTCAudioProcessing"),
         .package(url: "https://github.com/mxcl/AppUpdater.git", from: "1.0.0"),
         // Diarization evaluation and checkpoints depend on exact clustering behavior.
         // Keep this immutable and update it only with a reviewed before/after evaluation.
@@ -36,6 +37,7 @@ let package = Package(
                 "FluidAudio",
                 "PromiseKit",
                 "DynamicNotchKit",
+                .product(name: "FluidAEC3Bridge", package: "WebRTCAudioProcessing"),
                 .product(name: "TranscribeCpp", package: "transcribe-cpp-swift"),
             ],
             linkerSettings: [

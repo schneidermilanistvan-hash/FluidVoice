@@ -25,8 +25,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         #if DEBUG
-            // Trial A and C2 autoruns must return before Core Audio observers, logging, AppServices, and UI
-            // startup. The autorun owns its bounded SCK stream and exits after one report.
+            // Stage 0.5, Trial A, and C2 autoruns must return before Core Audio observers,
+            // logging, AppServices, and UI startup. Each owns one bounded diagnostic stream.
+            if MeetingStage05EvidenceAutorun.startIfRequested() {
+                return
+            }
             if MeetingExternalReferenceTrialAAutorun.startIfRequested() {
                 return
             }

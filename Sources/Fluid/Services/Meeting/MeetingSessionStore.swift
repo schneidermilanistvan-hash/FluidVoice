@@ -234,11 +234,28 @@ actor MeetingSessionStore: MeetingSessionStoring {
                 self.reconcileChunkFile(chunk, sessionDirectory: sessionDirectory)
             }.sorted { $0.sequence < $1.sequence }
 
-            if let index = session.audioTracks.firstIndex(where: { $0.kind == kind }) {
-                guard session.audioTracks[index].id == track.id else { continue }
-                session.audioTracks[index] = track
+            var candidate = session
+            if let index = candidate.audioTracks.firstIndex(where: { $0.kind == kind }) {
+                guard candidate.audioTracks[index].id == track.id else { continue }
+                candidate.audioTracks[index] = track
             } else {
-                session.audioTracks.append(track)
+                candidate.audioTracks.append(track)
+            }
+            candidate.audioTracks.sort { $0.kind.rawValue < $1.kind.rawValue }
+            candidate.timebase.firstPresentationTime = candidate.audioTracks
+                .flatMap(\.chunks)
+                .map(\.presentationStart)
+                .min()
+            do {
+                try candidate.validateForPersistence()
+                session = candidate
+            } catch {
+                // A crash-window track manifest is subordinate to the last valid session snapshot.
+                // Never let one malformed track make its sibling audio and recovery state unloadable.
+                DebugLogger.shared.warning(
+                    "Ignored invalid \(kind.rawValue) track recovery manifest: \(error.localizedDescription)",
+                    source: "MeetingSessionStore"
+                )
             }
         }
 

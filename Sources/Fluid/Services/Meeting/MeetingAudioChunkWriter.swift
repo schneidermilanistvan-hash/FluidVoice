@@ -9,9 +9,11 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
 
     private final class SampleBox: @unchecked Sendable {
         let sampleBuffer: CMSampleBuffer
+        let producerEpoch: UInt64
 
-        init(_ sampleBuffer: CMSampleBuffer) {
+        init(_ sampleBuffer: CMSampleBuffer, producerEpoch: UInt64) {
             self.sampleBuffer = sampleBuffer
+            self.producerEpoch = producerEpoch
         }
     }
 
@@ -19,6 +21,11 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
         case accepting
         case stopping
         case stopped
+    }
+
+    enum SequencedCommandError: Error {
+        case writerNotAccepting
+        case queueFull
     }
 
     private struct ActiveChunk: @unchecked Sendable {
@@ -34,6 +41,7 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
         /// Captured at `beginChunk` — `self.track.format` may already be the NEXT chunk's by finalize.
         var format: MeetingAudioFormat
         var sourceFormatDescription: CMFormatDescription
+        var producerEpoch: UInt64
     }
 
     private enum FinalizationResult: @unchecked Sendable {
@@ -45,7 +53,7 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
     private let finalizationQueue: DispatchQueue
     private let finalizationGroup = DispatchGroup()
     private let finalizationSlots = DispatchSemaphore(value: 2)
-    private let pendingSlots = DispatchSemaphore(value: 24)
+    private let pendingSlots: DispatchSemaphore
     private let stateLock = NSLock()
     private let sessionDirectory: URL
     private let trackDirectory: URL
@@ -60,12 +68,26 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
     private var activeChunk: ActiveChunk?
     /// Set synchronously when a chunk closes, since `track.chunks.last` can be stale (finalization is async).
     private var lastFinalizedEnd: CMTime?
+    /// Monotonically identifies the producer that owns callback order. Samples from retired
+    /// producers are rejected instead of being retimed as duplicate audio.
+    private var currentProducerEpoch: UInt64?
+    /// Canonical mapping from the current producer's own clock onto the meeting timeline. A new
+    /// epoch (or a backward reset inside one) establishes this offset exactly once; every later
+    /// sample of that epoch is then shifted by the same delta, so a producer that restarts at zero
+    /// stays internally contiguous instead of being clamped sample-by-sample onto one instant.
+    private var canonicalTimelineOffset: CMTime = .zero
+    /// The epoch `canonicalTimelineOffset` was established for. Purely diagnostic bookkeeping that
+    /// makes the "offset belongs to one producer epoch" invariant explicit.
+    private var canonicalTimelineOffsetEpoch: UInt64?
     private var lifecycle: Lifecycle = .accepting
     private var stopWaiters: [CheckedContinuation<MeetingAudioTrack, Never>] = []
     private var stoppedTrack: MeetingAudioTrack?
     private var nextChunkSequence = 0
     private var pendingDroppedSampleCount = 0
     private var dropReportScheduled = false
+    /// At most one bounded overflow command may bypass `pendingSlots`, solely to publish a
+    /// conservative in-memory safety era before a terminal stop.
+    private var emergencySafetyCommandPending = false
     private var lastHealthEmission = Date.distantPast
     private var lastLevelMeasurement = Date.distantPast
     private var silenceAccumulatedSeconds: Double = 0
@@ -77,7 +99,8 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
         track: MeetingAudioTrack,
         sessionDirectory: URL,
         chunkDuration: TimeInterval,
-        eventHandler: @escaping EventHandler
+        eventHandler: @escaping EventHandler,
+        pendingSlotLimit: Int = 24
     ) throws {
         self.trackID = track.id
         self.track = track
@@ -96,6 +119,7 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
             label: "com.fluidvoice.meeting.writer.\(track.kind.rawValue).finalization",
             qos: .utility
         )
+        self.pendingSlots = DispatchSemaphore(value: max(0, pendingSlotLimit))
 
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -110,11 +134,12 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
         try self.persistTrackManifest()
     }
 
-    func enqueue(_ sampleBuffer: CMSampleBuffer) {
+    @discardableResult
+    func enqueue(_ sampleBuffer: CMSampleBuffer, producerEpoch: UInt64 = 0) -> Bool {
         self.stateLock.lock()
         guard self.lifecycle == .accepting else {
             self.stateLock.unlock()
-            return
+            return false
         }
 
         guard self.pendingSlots.wait(timeout: .now()) == .success else {
@@ -127,15 +152,122 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
                     self?.drainDroppedSampleReport()
                 }
             }
+            return false
+        }
+
+        let sampleBox = SampleBox(sampleBuffer, producerEpoch: producerEpoch)
+        self.queue.async { [weak self, sampleBox] in
+            defer { self?.pendingSlots.signal() }
+            self?.consume(sampleBox.sampleBuffer, producerEpoch: sampleBox.producerEpoch)
+        }
+        self.stateLock.unlock()
+        return true
+    }
+
+    /// Runs a safety-era mutation, durable manifest write, and sample consume as one writer-queue
+    /// command. Callers may open live admission only from the success completion. On a fail-closed
+    /// persistence error the conservative candidate remains the in-memory track and the sample is
+    /// not consumed.
+    func enqueue(
+        _ sampleBuffer: CMSampleBuffer,
+        producerEpoch: UInt64 = 0,
+        afterPersistingMetadata mutate: @escaping @Sendable (inout MeetingAudioTrack) -> Void,
+        failClosed: Bool,
+        completion: @escaping @Sendable (Result<Void, Error>) -> Void
+    ) {
+        self.stateLock.lock()
+        guard self.lifecycle == .accepting else {
+            self.stateLock.unlock()
+            completion(.failure(SequencedCommandError.writerNotAccepting))
+            return
+        }
+        guard self.pendingSlots.wait(timeout: .now()) == .success else {
+            self.failOverflowedSequencedCommand(failClosed: failClosed, mutate: mutate, completion: completion)
             return
         }
 
-        let sampleBox = SampleBox(sampleBuffer)
-        self.queue.async { [weak self, sampleBox] in
-            defer { self?.pendingSlots.signal() }
-            self?.consume(sampleBox.sampleBuffer)
+        let sampleBox = SampleBox(sampleBuffer, producerEpoch: producerEpoch)
+        self.queue.async { [self, sampleBox] in
+            defer { self.pendingSlots.signal() }
+            var candidate = self.track
+            mutate(&candidate)
+            do {
+                try self.persistTrackManifest(candidate)
+                self.track = candidate
+                self.consume(sampleBox.sampleBuffer, producerEpoch: sampleBox.producerEpoch)
+                completion(.success(()))
+            } catch {
+                if failClosed { self.track = candidate }
+                completion(.failure(error))
+            }
         }
         self.stateLock.unlock()
+    }
+
+    /// Enqueues a durable metadata-only command in the same bounded order as audio samples.
+    /// This is used for safety transitions that must cut the writer timeline before a later
+    /// callback is allowed to enqueue raw microphone audio.
+    func enqueueMetadata(
+        failClosed: Bool,
+        mutate: @escaping @Sendable (inout MeetingAudioTrack) -> Void,
+        completion: @escaping @Sendable (Result<Void, Error>) -> Void
+    ) {
+        self.stateLock.lock()
+        guard self.lifecycle == .accepting else {
+            self.stateLock.unlock()
+            completion(.failure(SequencedCommandError.writerNotAccepting))
+            return
+        }
+        guard self.pendingSlots.wait(timeout: .now()) == .success else {
+            self.failOverflowedSequencedCommand(failClosed: failClosed, mutate: mutate, completion: completion)
+            return
+        }
+
+        self.queue.async { [self] in
+            defer { self.pendingSlots.signal() }
+            var candidate = self.track
+            mutate(&candidate)
+            do {
+                try self.persistTrackManifest(candidate)
+                self.track = candidate
+                completion(.success(()))
+            } catch {
+                if failClosed { self.track = candidate }
+                completion(.failure(error))
+            }
+        }
+        self.stateLock.unlock()
+    }
+
+    /// Full-queue path for sequenced commands. Must be called with `stateLock` held; returns with
+    /// it released. A fail-closed command gets one bounded slot-bypassing emergency run so the
+    /// conservative era still reaches the in-memory track (and best-effort the manifest).
+    private func failOverflowedSequencedCommand(
+        failClosed: Bool,
+        mutate: @escaping @Sendable (inout MeetingAudioTrack) -> Void,
+        completion: @escaping @Sendable (Result<Void, Error>) -> Void
+    ) {
+        self.pendingDroppedSampleCount += 1
+        let shouldScheduleReport = !self.dropReportScheduled
+        self.dropReportScheduled = true
+        let enqueueEmergency = failClosed && !self.emergencySafetyCommandPending
+        if enqueueEmergency { self.emergencySafetyCommandPending = true }
+        self.stateLock.unlock()
+        if shouldScheduleReport {
+            self.queue.async { [weak self] in self?.drainDroppedSampleReport() }
+        }
+        if enqueueEmergency {
+            self.queue.async { [self] in
+                var candidate = self.track
+                mutate(&candidate)
+                self.track = candidate
+                try? self.persistTrackManifest(candidate)
+                self.stateLock.withLock { self.emergencySafetyCommandPending = false }
+                completion(.failure(SequencedCommandError.queueFull))
+            }
+        } else {
+            completion(.failure(SequencedCommandError.queueFull))
+        }
     }
 
     func stop() async -> MeetingAudioTrack {
@@ -233,31 +365,86 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
         }
     }
 
-    private func consume(_ sampleBuffer: CMSampleBuffer) {
-        guard CMSampleBufferIsValid(sampleBuffer), CMSampleBufferDataIsReady(sampleBuffer) else {
+    private func consume(_ sourceSampleBuffer: CMSampleBuffer, producerEpoch: UInt64) {
+        guard CMSampleBufferIsValid(sourceSampleBuffer), CMSampleBufferDataIsReady(sourceSampleBuffer) else {
             self.recordDroppedSample(detail: "Capture delivered an invalid audio sample.")
             return
         }
-        let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        guard presentationTime.isValid, presentationTime.isNumeric else {
+        let sourcePresentationTime = CMSampleBufferGetPresentationTimeStamp(sourceSampleBuffer)
+        guard sourcePresentationTime.isValid, sourcePresentationTime.isNumeric else {
             self.recordDroppedSample(detail: "Capture delivered audio without a valid presentation timestamp.")
             return
         }
 
+        if let currentProducerEpoch = self.currentProducerEpoch, producerEpoch < currentProducerEpoch {
+            self.recordDroppedSample(detail: "Capture delivered audio from a retired producer epoch.")
+            return
+        }
+
+        let duration = Self.sampleDuration(sourceSampleBuffer)
+        let previousEnd = self.activeChunk?.end ?? self.lastFinalizedEnd
+        let epochChanged = self.currentProducerEpoch.map { producerEpoch > $0 } ?? false
+        self.currentProducerEpoch = max(self.currentProducerEpoch ?? producerEpoch, producerEpoch)
+
+        // A new producer brings its own clock origin; its canonical mapping is derived below from
+        // the first sample it delivers rather than inherited from the retired producer.
+        if epochChanged {
+            self.canonicalTimelineOffset = .zero
+            self.canonicalTimelineOffsetEpoch = nil
+        }
+
+        var presentationTime = sourcePresentationTime + self.canonicalTimelineOffset
+        var backwardReset = false
+        if let previousEnd, presentationTime < previousEnd {
+            // Establish (or re-establish) the mapping once, then keep applying it. Anchoring the
+            // offset instead of clamping each sample preserves the producer's internal spacing.
+            self.canonicalTimelineOffset = previousEnd - sourcePresentationTime
+            self.canonicalTimelineOffsetEpoch = producerEpoch
+            presentationTime = previousEnd
+            backwardReset = true
+        } else if self.canonicalTimelineOffsetEpoch == nil {
+            self.canonicalTimelineOffsetEpoch = producerEpoch
+        }
+
+        var boundaryDiscontinuity: MeetingAudioDiscontinuity?
+        if previousEnd != nil, epochChanged || backwardReset {
+            boundaryDiscontinuity = MeetingAudioDiscontinuity(
+                kind: .clockDiscontinuity,
+                presentationTime: Self.mediaTime(sourcePresentationTime),
+                gapSeconds: nil,
+                detail: epochChanged
+                    ? "Capture producer epoch changed."
+                    : "Presentation timestamp moved backwards."
+            )
+        }
+
+        let sampleBuffer: CMSampleBuffer
+        if presentationTime != sourcePresentationTime {
+            guard let retimed = Self.retimedCopy(sourceSampleBuffer, presentationTime: presentationTime) else {
+                self.recordDroppedSample(detail: "Capture audio could not be normalized onto the meeting timeline.")
+                return
+            }
+            sampleBuffer = retimed
+        } else {
+            sampleBuffer = sourceSampleBuffer
+        }
+
         if let activeChunk = self.activeChunk {
             let elapsed = CMTimeGetSeconds(presentationTime - activeChunk.start)
-            let backwards = presentationTime < activeChunk.end
             let gap = CMTimeGetSeconds(presentationTime - activeChunk.end)
-            if elapsed >= self.chunkDuration || backwards || gap > 0.5 {
-                if backwards || gap > 0.5 {
+            // Compared on the canonical timeline: once the epoch's offset is established, later
+            // samples are contiguous here even though their raw stamps are far behind `end`.
+            let clockBoundary = epochChanged || backwardReset
+            if elapsed >= self.chunkDuration || clockBoundary || gap > 0.5 {
+                if clockBoundary || gap > 0.5 {
                     self.silenceAccumulatedSeconds = 0
-                    let kind: MeetingInterruptionKind = backwards ? .clockDiscontinuity : .sourceLost
-                    self.activeChunk?.discontinuities.append(MeetingAudioDiscontinuity(
-                        kind: kind,
-                        presentationTime: Self.mediaTime(presentationTime),
-                        gapSeconds: backwards ? nil : gap,
-                        detail: backwards ? "Presentation timestamp moved backwards." : "Unexpected audio gap."
+                    self.activeChunk?.discontinuities.append(boundaryDiscontinuity ?? MeetingAudioDiscontinuity(
+                        kind: .sourceLost,
+                        presentationTime: Self.mediaTime(sourcePresentationTime),
+                        gapSeconds: gap,
+                        detail: "Unexpected audio gap."
                     ))
+                    boundaryDiscontinuity = nil
                 }
                 self.scheduleActiveChunkFinalization()
             }
@@ -265,12 +452,22 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
 
         do {
             if self.activeChunk == nil {
-                try self.beginChunk(with: sampleBuffer, at: presentationTime)
+                try self.beginChunk(
+                    with: sampleBuffer,
+                    at: presentationTime,
+                    producerEpoch: producerEpoch,
+                    discontinuities: boundaryDiscontinuity.map { [$0] } ?? []
+                )
             } else if let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
                       !CMFormatDescriptionEqual(formatDescription, otherFormatDescription: self.activeChunk?.sourceFormatDescription)
             {
                 self.scheduleActiveChunkFinalization()
-                try self.beginChunk(with: sampleBuffer, at: presentationTime)
+                try self.beginChunk(
+                    with: sampleBuffer,
+                    at: presentationTime,
+                    producerEpoch: producerEpoch,
+                    discontinuities: []
+                )
             }
             guard var activeChunk = self.activeChunk else { return }
             guard activeChunk.input.isReadyForMoreMediaData else {
@@ -283,7 +480,6 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
                 )
             }
 
-            let duration = Self.sampleDuration(sampleBuffer)
             activeChunk.end = presentationTime + duration
             self.activeChunk = activeChunk
             self.track.health.status = .healthy
@@ -316,7 +512,12 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
         }
     }
 
-    private func beginChunk(with sampleBuffer: CMSampleBuffer, at start: CMTime) throws {
+    private func beginChunk(
+        with sampleBuffer: CMSampleBuffer,
+        at start: CMTime,
+        producerEpoch: UInt64,
+        discontinuities: [MeetingAudioDiscontinuity]
+    ) throws {
         guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)?.pointee,
               asbd.mSampleRate > 0,
@@ -354,18 +555,9 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
                 writer.error?.localizedDescription ?? "The audio writer could not start."
             )
         }
-        // A cross-clock-domain producer swap must not overlap the chunk just finalized.
-        let clampedStart: CMTime
-        if let lastFinalizedEnd = self.lastFinalizedEnd, start < lastFinalizedEnd {
-            clampedStart = lastFinalizedEnd
-            DebugLogger.shared.warning(
-                "Meeting audio writer clamped a chunk start that preceded the prior chunk's end.",
-                source: "MeetingAudioChunkWriter"
-            )
-        } else {
-            clampedStart = start
-        }
-        writer.startSession(atSourceTime: clampedStart)
+        // `consume` normalizes the sample itself before it reaches AVAssetWriter. Chunk metadata and
+        // encoded sample timing therefore live on one canonical timeline.
+        writer.startSession(atSourceTime: start)
 
         let format = MeetingAudioFormat(
             codec: "aac-lc",
@@ -385,11 +577,12 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
             relativeFinalPath: relativePath,
             writer: writer,
             input: input,
-            start: clampedStart,
-            end: clampedStart,
-            discontinuities: [],
+            start: start,
+            end: start,
+            discontinuities: discontinuities,
             format: format,
-            sourceFormatDescription: formatDescription
+            sourceFormatDescription: formatDescription,
+            producerEpoch: producerEpoch
         )
     }
 
@@ -454,6 +647,12 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
     }
 
     private nonisolated static func finalize(_ activeChunk: ActiveChunk) -> FinalizationResult {
+        guard activeChunk.end >= activeChunk.start else {
+            return .failed(
+                self.failedChunk(from: activeChunk),
+                "Audio chunk timing was not monotonic."
+            )
+        }
         let completion = DispatchSemaphore(value: 0)
         activeChunk.writer.finishWriting { completion.signal() }
         guard completion.wait(timeout: .now() + 4) == .success else {
@@ -503,7 +702,7 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
             sequence: activeChunk.sequence,
             relativeFilePath: activeChunk.relativeFinalPath,
             presentationStart: self.mediaTime(activeChunk.start),
-            presentationEnd: self.mediaTime(activeChunk.end),
+            presentationEnd: self.mediaTime(max(activeChunk.end, activeChunk.start)),
             discontinuities: activeChunk.discontinuities,
             sha256: "",
             byteCount: 0,
@@ -567,6 +766,56 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
             value: CMTimeValue(CMSampleBufferGetNumSamples(sampleBuffer)),
             timescale: CMTimeScale(asbd.mSampleRate.rounded())
         )
+    }
+
+    /// Retimes every timing entry by one delta so PCM duration/order are preserved while writer
+    /// metadata and encoded timestamps share the same monotonic meeting timeline.
+    private static func retimedCopy(
+        _ sampleBuffer: CMSampleBuffer,
+        presentationTime: CMTime
+    ) -> CMSampleBuffer? {
+        var timingCount = 0
+        guard CMSampleBufferGetSampleTimingInfoArray(
+            sampleBuffer,
+            entryCount: 0,
+            arrayToFill: nil,
+            entriesNeededOut: &timingCount
+        ) == noErr, timingCount > 0 else { return nil }
+
+        var timings = Array(
+            repeating: CMSampleTimingInfo(
+                duration: .invalid,
+                presentationTimeStamp: .invalid,
+                decodeTimeStamp: .invalid
+            ),
+            count: timingCount
+        )
+        guard CMSampleBufferGetSampleTimingInfoArray(
+            sampleBuffer,
+            entryCount: timingCount,
+            arrayToFill: &timings,
+            entriesNeededOut: &timingCount
+        ) == noErr else { return nil }
+
+        let original = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let delta = presentationTime - original
+        for index in timings.indices {
+            if timings[index].presentationTimeStamp.isValid {
+                timings[index].presentationTimeStamp = timings[index].presentationTimeStamp + delta
+            }
+            if timings[index].decodeTimeStamp.isValid {
+                timings[index].decodeTimeStamp = timings[index].decodeTimeStamp + delta
+            }
+        }
+        var copy: CMSampleBuffer?
+        let status = CMSampleBufferCreateCopyWithNewTiming(
+            allocator: kCFAllocatorDefault,
+            sampleBuffer: sampleBuffer,
+            sampleTimingEntryCount: timingCount,
+            sampleTimingArray: &timings,
+            sampleBufferOut: &copy
+        )
+        return status == noErr ? copy : nil
     }
 
     private static func sha256(of url: URL) throws -> String {

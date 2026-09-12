@@ -32,6 +32,29 @@ final class MeetingVoiceProcessingCaptureTests: XCTestCase {
         XCTAssertEqual(decision, .voiceProcessing)
     }
 
+    func testPreproductionDirectAEC3PreferenceSelectsPairedScreenCaptureKit() {
+        let decision = MeetingCapturePathDecider.decide(
+            mode: .onlineCall,
+            microphone: self.mic(),
+            outputRoute: self.viableRoute(),
+            preferDirectAEC3: true
+        )
+        XCTAssertEqual(
+            decision,
+            .screenCaptureKit(reason: MeetingCapturePathDecider.directAEC3DefaultReason)
+        )
+    }
+
+    func testDirectAEC3GateDefaultsOnAndHasExactDisableEscapeHatch() {
+        XCTAssertTrue(MeetingDirectAEC3Gate.enabled(environment: [:]))
+        XCTAssertTrue(MeetingDirectAEC3Gate.enabled(environment: [
+            MeetingDirectAEC3Gate.disableEnvironmentKey: "true"
+        ]))
+        XCTAssertFalse(MeetingDirectAEC3Gate.enabled(environment: [
+            MeetingDirectAEC3Gate.disableEnvironmentKey: "1"
+        ]))
+    }
+
 #if DEBUG
     func testExplicitC2GateCanForcePairedScreenCaptureKitWithoutChangingDefault() {
         let defaultDecision = MeetingCapturePathDecider.decide(
@@ -39,7 +62,8 @@ final class MeetingVoiceProcessingCaptureTests: XCTestCase {
         )
         let forcedDecision = MeetingCapturePathDecider.decide(
             mode: .onlineCall, microphone: self.mic(), outputRoute: self.viableRoute(),
-            forcePairedScreenCaptureKit: true
+            forcePairedScreenCaptureKit: true,
+            preferDirectAEC3: true
         )
         XCTAssertEqual(defaultDecision, .voiceProcessing)
         XCTAssertEqual(

@@ -20,6 +20,7 @@ struct FluidApp: App {
             #if DEBUG
                 if MeetingExternalReferenceTrialAGate.autorunEnabled(environment: ProcessInfo.processInfo.environment)
                     || MeetingSCKPairedDiagnosticGate.autorunEnabled()
+                    || MeetingStage05EvidenceAutorun.requested()
                     || ProcessInfo.processInfo.environment["FLUIDVOICE_MIC_PHASE1"] != nil
                     || ProcessInfo.processInfo.environment["FLUIDVOICE_VPIO_ACOUSTIC"] == "1"
                 {

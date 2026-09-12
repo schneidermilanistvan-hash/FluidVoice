@@ -264,6 +264,51 @@ final class MeetingReferenceSynchronizerTests: XCTestCase {
         XCTAssertTrue(result.frames[1].resynchronizationBoundary)
     }
 
+    func testLongReferencePTSDiscontinuityIsMaskedFrozenAndResynchronized() {
+        let frameCount = 1_400
+        let gapIndex = 700
+        let gapSeconds = 0.002
+        let configuration = MeetingReferenceSynchronizerConfiguration(
+            referenceScope: .authorizedFullMix,
+            referenceCompleteness: .measuredComplete
+        )
+        let microphone = (0..<frameCount).map {
+            mic($0, start: Int64($0 * 160), host: Double($0) * 0.01,
+                value: Float(($0 % 13) + 1))
+        }
+        let reference = (0..<frameCount).map { index in
+            ref(index, pts: Double(index) * 0.01 + (index >= gapIndex ? gapSeconds : 0),
+                value: Float((index % 17) + 1))
+        }
+        let synchronizer = MeetingReferenceSynchronizer(configuration: configuration)
+
+        let result = synchronizer.synchronize(microphone: microphone, reference: reference)
+        let replay = synchronizer.synchronize(microphone: microphone, reference: reference)
+
+        XCTAssertEqual(result, replay)
+        XCTAssertFalse(result.failedOpen)
+        XCTAssertEqual(result.frames.count, frameCount + 1)
+        XCTAssertEqual(result.diagnostics.epochCount, 2)
+
+        let gapFrames = result.frames.filter { $0.unknownReasons.contains(.referenceGap) }
+        XCTAssertEqual(gapFrames.count, 1)
+        guard let gapFrame = gapFrames.first else { return }
+        XCTAssertEqual(gapFrame.index, gapIndex)
+        XCTAssertEqual(gapFrame.renderValidMask.filter { !$0 }.count, 32)
+        XCTAssertTrue(gapFrame.captureValidMask.allSatisfy { $0 })
+        XCTAssertTrue(gapFrame.adaptationFrozen)
+        XCTAssertTrue(gapFrame.resynchronizationBoundary)
+        XCTAssertTrue(zip(gapFrame.renderSamples, gapFrame.renderValidMask).allSatisfy {
+            $0.1 || $0.0 == 0
+        })
+
+        let resumed = result.frames[gapIndex + 1]
+        XCTAssertEqual(resumed.epochID, 1)
+        XCTAssertTrue(resumed.renderValidMask.allSatisfy { $0 })
+        XCTAssertFalse(resumed.adaptationFrozen)
+        XCTAssertFalse(resumed.unknownReasons.contains(.referenceGap))
+    }
+
     func testInvalidReferencePTSAndRateCreateReferenceGapEpoch() {
         let invalidPTS = MeetingReferencePCMFrame(sequenceNumber: 1, presentationTime: .nan,
             sampleRate: sampleRate, samples: [Float](repeating: 2, count: 160))
@@ -599,5 +644,176 @@ final class MeetingReferenceSynchronizerTests: XCTestCase {
         XCTAssertEqual(result.diagnostics.nonFiniteSampleCount, 0)
         XCTAssertTrue(result.frames[0].captureValidMask.allSatisfy { $0 })
         XCTAssertTrue(result.frames[0].captureSamples.allSatisfy { $0.isFinite })
+    }
+
+    func testStage05DelayContractRequiresRenderBeforeCaptureAndOneAdaptiveOwner() {
+        let contract = MeetingAECDelayContract(renderLeadSeconds: 0.020, boundedEngineHintSeconds: 0.100)
+        let valid = [
+            MeetingAECDelayContractEvent(frameIndex: 0, kind: .render),
+            MeetingAECDelayContractEvent(frameIndex: 0, kind: .capture),
+            MeetingAECDelayContractEvent(frameIndex: 1, kind: .render),
+            MeetingAECDelayContractEvent(frameIndex: 1, kind: .capture)
+        ]
+        XCTAssertTrue(contract.isValid)
+        XCTAssertTrue(contract.validates(events: valid))
+        XCTAssertFalse(contract.validates(events: Array(valid.reversed())))
+    }
+
+    func testStage05DelayContractAcceptsSynchronizerEpochAndMaskOutput() {
+        let result = MeetingReferenceSynchronizer().synchronize(
+            microphone: (0..<2).map { mic($0, start: Int64($0 * 160), host: Double($0) * 0.01) },
+            reference: (0..<2).map { ref($0, pts: Double($0) * 0.01) })
+        let contract = MeetingAECDelayContract(renderLeadSeconds: 0.010)
+        XCTAssertTrue(contract.validates(synchronizedResult: result))
+        XCTAssertTrue(result.frames.allSatisfy { $0.epochID >= 0 && $0.renderValidMask.count == $0.captureValidMask.count })
+    }
+
+    func testStage05ManifestRejectsCompressedUnsafeAndWrongTopologyArtifacts() {
+        let artifact = MeetingSignalDomainGateManifest.Artifact(
+            role: "render", relativePath: "../render.m4a", sha256: String(repeating: "a", count: 64),
+            codec: "aac", lossless: false, sampleRateHz: 16_000, channelCount: 1, durationSeconds: 1)
+        let capture = MeetingSignalDomainGateManifest.Artifact(
+            role: "capture", relativePath: "capture.wav", sha256: String(repeating: "b", count: 64),
+            codec: "pcm_s16le", lossless: true, sampleRateHz: 16_000, channelCount: 1, durationSeconds: 1)
+        let manifest = MeetingSignalDomainGateManifest(
+            topology: .vpio, route: .externalDevice, referenceScope: .unknown,
+            referenceCompletenessMeasured: false, consentConfirmed: false, artifacts: [artifact, capture])
+        let reasons = manifest.validationReasons()
+        XCTAssertTrue(reasons.contains(.unsupportedTopology))
+        XCTAssertTrue(reasons.contains(.nonLossless))
+        XCTAssertTrue(reasons.contains(.unsupportedCodec))
+        XCTAssertTrue(reasons.contains(.invalidManifest))
+        XCTAssertTrue(reasons.contains(.missingConsent))
+    }
+
+    func testStage05MetadataOnlyInputIsExplicitlyUnscoredAndRetainsNoContent() {
+        let artifact = { (role: String, path: String) in MeetingSignalDomainGateManifest.Artifact(
+            role: role, relativePath: path, sha256: String(repeating: "a", count: 64),
+            codec: "pcm_s16le", lossless: true, sampleRateHz: 16_000,
+            channelCount: 1, durationSeconds: 1) }
+        let manifest = MeetingSignalDomainGateManifest(
+            topology: .pairedScreenCaptureKit, route: .builtInSpeakerMicrophone,
+            referenceScope: .selectedApplication, referenceCompletenessMeasured: true,
+            consentConfirmed: true,
+            artifacts: [artifact("render", "r.wav"), artifact("capture", "c.wav")])
+        let session = MeetingSignalDomainGateSession(ordinal: 7, renderBlocks: [], captureBlocks: [])
+        let report = MeetingSignalDomainGate.evaluate(manifest: manifest, sessions: [session])
+        XCTAssertEqual(report.outcome, .unscored)
+        XCTAssertEqual(report.eligibleSessionCount, 0)
+        XCTAssertFalse(report.rawPCMRetained)
+        XCTAssertFalse(report.transcriptRetained)
+        XCTAssertFalse(report.pathsRetained)
+        XCTAssertTrue(report.excludedSessions.first?.reasons.contains(.metadataOnly) == true)
+    }
+
+    func testStage05RejectsGapOverlapDuplicateOrdinalAndInvalidThresholds() {
+        let artifact = { (role: String, path: String) in MeetingSignalDomainGateManifest.Artifact(
+            role: role, relativePath: path, sha256: String(repeating: "a", count: 64),
+            codec: "pcm_s16le", lossless: true, sampleRateHz: 16_000, channelCount: 1, durationSeconds: 2) }
+        let manifest = MeetingSignalDomainGateManifest(
+            topology: .pairedScreenCaptureKit, route: .builtInSpeakerMicrophone,
+            referenceScope: .selectedApplication, referenceCompletenessMeasured: true,
+            consentConfirmed: true, artifacts: [artifact("render", "r.wav"), artifact("capture", "c.wav")])
+        let samples = [Float](repeating: 0.1, count: 16_000)
+        let first = MeetingSignalDomainGateTrackBlock(presentationSeconds: 0, durationSeconds: 1, arrivalSeconds: 0, samples: samples)
+        let gap = MeetingSignalDomainGateTrackBlock(presentationSeconds: 2, durationSeconds: 1, arrivalSeconds: 2, samples: samples)
+        let overlap = MeetingSignalDomainGateTrackBlock(presentationSeconds: 2.5, durationSeconds: 1, arrivalSeconds: 2.5, samples: samples)
+        let session = MeetingSignalDomainGateSession(ordinal: 1, renderBlocks: [first, gap, overlap], captureBlocks: [first, gap, overlap])
+        let thresholds = MeetingSignalDomainGateThresholds(minimumExposureSeconds: 0.1)
+        let report = MeetingSignalDomainGate.evaluate(manifest: manifest, sessions: [session, session], thresholds: thresholds)
+        XCTAssertTrue(report.reasonCounts[MeetingSignalDomainGateReason.gapDetected.rawValue] ?? 0 > 0)
+        XCTAssertTrue(report.reasonCounts[MeetingSignalDomainGateReason.overlappingBlocks.rawValue] ?? 0 > 0)
+        XCTAssertTrue(report.reasonCounts[MeetingSignalDomainGateReason.duplicateOrdinal.rawValue] ?? 0 > 0)
+
+        let invalid = MeetingSignalDomainGateThresholds(maximumSearchDelaySeconds: .nan)
+        let invalidReport = MeetingSignalDomainGate.evaluate(manifest: manifest, sessions: [], thresholds: invalid)
+        XCTAssertTrue(invalidReport.reasonCounts[MeetingSignalDomainGateReason.invalidThresholds.rawValue] ?? 0 > 0)
+    }
+
+    func testStage05MissingArrivalMetadataIsNotTreatedAsMeasuredJitter() {
+        let artifact = { (role: String, path: String) in MeetingSignalDomainGateManifest.Artifact(
+            role: role, relativePath: path, sha256: String(repeating: "a", count: 64),
+            codec: "pcm_s16le", lossless: true, sampleRateHz: 16_000, channelCount: 1, durationSeconds: 2) }
+        let manifest = MeetingSignalDomainGateManifest(
+            topology: .pairedScreenCaptureKit, route: .builtInSpeakerMicrophone,
+            referenceScope: .selectedApplication, referenceCompletenessMeasured: true,
+            consentConfirmed: true, artifacts: [artifact("render", "r.wav"), artifact("capture", "c.wav")])
+        let block = MeetingSignalDomainGateTrackBlock(presentationSeconds: 0, durationSeconds: 1, samples: [0.1, 0.2])
+        let session = MeetingSignalDomainGateSession(ordinal: 2, renderBlocks: [block], captureBlocks: [block])
+        let report = MeetingSignalDomainGate.evaluate(manifest: manifest, sessions: [session])
+        XCTAssertTrue(report.reasonCounts[MeetingSignalDomainGateReason.missingArrivalMetadata.rawValue] ?? 0 > 0)
+        XCTAssertNil(report.metrics.first?.deliveryJitterP50Seconds)
+    }
+
+    func testStage05DeterministicMultibandFIRFixtureCanPassSignalGate() {
+        let sampleRate = 16_000.0
+        var state: UInt32 = 0x1234_5678
+        let samples = (0..<16_000).map { index -> Float in
+            let t = Double(index) / sampleRate
+            state = state &* 1_664_525 &+ 1_013_904_223
+            let noise = (Float(state) / Float(UInt32.max) - 0.5) * 0.01
+            return Float(0.08 * (sin(2 * .pi * 250 * t) + sin(2 * .pi * 1_000 * t) + sin(2 * .pi * 4_000 * t)) / 3) + noise
+        }
+        let blocks = stride(from: 0, to: 16_000, by: 4_000).map { start in
+            MeetingSignalDomainGateTrackBlock(presentationSeconds: Double(start) / sampleRate,
+                durationSeconds: 0.25, arrivalSeconds: Double(start) / sampleRate,
+                samples: Array(samples[start..<(start + 4_000)]))
+        }
+        let artifact = { (role: String, path: String) in MeetingSignalDomainGateManifest.Artifact(
+            role: role, relativePath: path, sha256: String(repeating: "a", count: 64),
+            codec: "pcm_s16le", lossless: true, sampleRateHz: sampleRate, channelCount: 1, durationSeconds: 1) }
+        let manifest = MeetingSignalDomainGateManifest(
+            topology: .pairedScreenCaptureKit, route: .builtInSpeakerMicrophone,
+            referenceScope: .selectedApplication, referenceCompletenessMeasured: true,
+            consentConfirmed: true, artifacts: [artifact("render", "r.wav"), artifact("capture", "c.wav")])
+        let session = MeetingSignalDomainGateSession(ordinal: 3, renderBlocks: blocks, captureBlocks: blocks)
+        let report = MeetingSignalDomainGate.evaluate(manifest: manifest, sessions: [session],
+            thresholds: .init(maximumSearchDelaySeconds: 0.05, safetyMarginSeconds: 0.01,
+                              minimumBandCoherence: 0.05,
+                              maximumHeldOutLinearResidualFraction: 0.25))
+        XCTAssertEqual(report.outcome, .proceedToCandidate)
+        XCTAssertEqual(report.metrics.first?.sessionOrdinal, 3)
+        XCTAssertNotNil(report.metrics.first?.signedDelayP50Seconds)
+        XCTAssertNotNil(report.metrics.first?.signedDelayP95Seconds)
+        XCTAssertNotNil(report.metrics.first?.signedDelayP99Seconds)
+        XCTAssertNotNil(report.metrics.first?.driftP50PPM)
+        XCTAssertNotNil(report.metrics.first?.driftP95PPM)
+        XCTAssertNotNil(report.metrics.first?.driftP99PPM)
+        XCTAssertEqual(report.metrics.first?.bandCoherence.count, 3)
+        XCTAssertNotNil(report.metrics.first?.pathStabilityFraction)
+        XCTAssertNotNil(report.metrics.first?.clippingFraction)
+        XCTAssertNotNil(report.metrics.first?.heldOutLinearResidualFraction)
+        XCTAssertGreaterThanOrEqual(report.metrics.first?.delayObservationCount ?? 0, 3)
+    }
+
+    func testStage05TimeVaryingFIRFixtureFailsLearnabilityGate() {
+        let sampleRate = 16_000.0
+        let render = (0..<16_000).map { index in Float(sin(2 * .pi * 1_000 * Double(index) / sampleRate) * 0.1) }
+        let capture = render.enumerated().map { index, value in index >= 12_000 ? value * 0.05 : value }
+        let blocks = stride(from: 0, to: 16_000, by: 4_000).map { start in
+            MeetingSignalDomainGateTrackBlock(presentationSeconds: Double(start) / sampleRate,
+                durationSeconds: 0.25, arrivalSeconds: Double(start) / sampleRate,
+                samples: Array(render[start..<(start + 4_000)]))
+        }
+        let captureBlocks = stride(from: 0, to: 16_000, by: 4_000).map { start in
+            MeetingSignalDomainGateTrackBlock(presentationSeconds: Double(start) / sampleRate,
+                durationSeconds: 0.25, arrivalSeconds: Double(start) / sampleRate,
+                samples: Array(capture[start..<(start + 4_000)]))
+        }
+        let artifact = { (role: String, path: String) in MeetingSignalDomainGateManifest.Artifact(
+            role: role, relativePath: path, sha256: String(repeating: "a", count: 64),
+            codec: "pcm_s16le", lossless: true, sampleRateHz: sampleRate, channelCount: 1, durationSeconds: 1) }
+        let manifest = MeetingSignalDomainGateManifest(
+            topology: .pairedScreenCaptureKit, route: .builtInSpeakerMicrophone,
+            referenceScope: .selectedApplication, referenceCompletenessMeasured: true,
+            consentConfirmed: true, artifacts: [artifact("render", "r.wav"), artifact("capture", "c.wav")])
+        let session = MeetingSignalDomainGateSession(ordinal: 4, renderBlocks: blocks, captureBlocks: captureBlocks)
+        let report = MeetingSignalDomainGate.evaluate(manifest: manifest, sessions: [session],
+            thresholds: .init(maximumSearchDelaySeconds: 0.05, safetyMarginSeconds: 0.01,
+                              minimumBandCoherence: 0,
+                              maximumHeldOutLinearResidualFraction: 0.10))
+        XCTAssertEqual(report.outcome, .rejected)
+        XCTAssertTrue(report.metrics.isEmpty)
+        XCTAssertTrue(report.reasonCounts[MeetingSignalDomainGateReason.linearPathUnlearnable.rawValue] ?? 0 > 0)
     }
 }

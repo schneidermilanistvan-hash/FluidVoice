@@ -81,37 +81,40 @@ actor MeetingCaptureEngine: MeetingCaptureControlling {
 #else
             let forcePairedScreenCaptureKit = false
 #endif
+            let preferDirectAEC3 = MeetingDirectAEC3Gate.enabled()
             let decision = MeetingCapturePathDecider.decide(
                 mode: configuration.mode,
                 microphone: configuration.microphone,
                 outputRoute: outputRoute,
-                forcePairedScreenCaptureKit: forcePairedScreenCaptureKit
+                forcePairedScreenCaptureKit: forcePairedScreenCaptureKit,
+                preferDirectAEC3: preferDirectAEC3
             )
             switch decision {
             case let .screenCaptureKit(reason):
-                let protection = MeetingRawMicrophoneProtection.classify(outputRoute)
+                if reason == MeetingCapturePathDecider.directAEC3DefaultReason {
 #if DEBUG
-                let captureDecisionMessage = reason == MeetingCapturePathDecider.diagnosticForceScreenCaptureKitReason
-                    ? "C2 diagnostic forced paired ScreenCaptureKit; this is not a production fallback."
-                    : "Meeting voice-processing capture declined: \(reason)"
-                DebugLogger.shared.log(
-                    captureDecisionMessage,
-                    source: "MeetingCaptureEngine"
-                )
-#else
-                DebugLogger.shared.log(
-                    "Meeting voice-processing capture declined: \(reason)",
-                    source: "MeetingCaptureEngine"
-                )
+                    DebugLogger.shared.log(
+                        "Direct AEC3 selected for the built-in-speaker pre-production path.",
+                        source: "MeetingCaptureEngine"
+                    )
 #endif
-                eventHandler(.interrupted(kind: .voiceProcessingDeclined, trackID: nil, detail: reason))
+                } else {
+                    let captureDecisionMessage = reason == MeetingCapturePathDecider.diagnosticForceScreenCaptureKitReason
+                        ? "C2 diagnostic forced paired ScreenCaptureKit; this is not a production fallback."
+                        : "Meeting voice-processing capture declined: \(reason)"
+                    DebugLogger.shared.log(
+                        captureDecisionMessage,
+                        source: "MeetingCaptureEngine"
+                    )
+                    eventHandler(.interrupted(kind: .voiceProcessingDeclined, trackID: nil, detail: reason))
+                }
                 try await microphoneWriter.updateTrackMetadata { track in
                     track.captureEras = [MeetingCaptureEra(
                         method: .screenCaptureKit,
                         deviceUID: configuration.microphone.coreAudioUID,
                         deviceName: configuration.microphone.displayName,
                         roleAtElection: configuration.microphone.role,
-                        echoProtection: protection,
+                        echoProtection: .unprotected,
                         startSeconds: 0
                     )]
                 }
@@ -119,7 +122,7 @@ actor MeetingCaptureEngine: MeetingCaptureControlling {
                     application: application,
                     microphone: configuration.microphone,
                     includeMicrophone: true,
-                    microphoneEchoProtection: protection,
+                    microphoneEchoProtection: .unprotected,
                     applicationWriter: applicationWriter,
                     microphoneWriter: microphoneWriter,
                     eventHandler: eventHandler,
@@ -450,6 +453,105 @@ nonisolated enum MeetingWindowSelector {
     }
 }
 
+/// Health of the CoreAudio listener set backing a route observation. A degraded observation means
+/// at least one required listener is missing, so the route can change without any further
+/// notification: the owner must fail closed instead of silently operating unlistened.
+nonisolated enum MeetingOutputRouteListenerHealth: Equatable, Sendable {
+    case healthy
+    case degraded
+}
+
+/// Identity of the SCK producer the runtime owns, plus the route revision that authorized it.
+/// Publication and AEC commit are both gated on this triple, so an in-flight operation can compare
+/// the value it captured against the live one without retaining `SCStream`.
+nonisolated struct MeetingCaptureStreamOwnership: Equatable, Sendable {
+    var streamIdentity: UInt64
+    var streamGeneration: UInt64
+    var routeRevision: UInt64
+}
+
+/// Result of the final pending -> current publication decision.
+nonisolated enum MeetingCaptureStreamPublication: Equatable, Sendable {
+    /// Ownership matched: publish the candidate.
+    case commit
+    /// A newer revision or an ordered stop owns the outcome. Quietly abandon — never terminal.
+    case superseded
+    /// The candidate itself died. This is a real failure and stays terminal.
+    case failed
+}
+
+/// Commit-time authority shared by stream publication, AEC installation, and route-protection
+/// scheduling. Pure so the revision/ownership rules are testable without an `SCStream`.
+nonisolated enum MeetingCaptureOwnershipGate {
+    /// A newer `outputRouteRevision` is normal supersession, never a failure.
+    static func isSuperseded(observedRevision: UInt64, currentRevision: UInt64) -> Bool {
+        observedRevision != currentRevision
+    }
+
+    /// Queued route-protection work whose revision has already been superseded must not run at
+    /// all — not even to pay its debounce sleep.
+    static func shouldRunRouteProtection(
+        taskRevision: UInt64,
+        currentRevision: UInt64,
+        stopping: Bool
+    ) -> Bool {
+        !stopping && !Self.isSuperseded(observedRevision: taskRevision, currentRevision: currentRevision)
+    }
+
+    /// The replacement may only be published when the runtime still owns exactly the producers the
+    /// replacement was built against, under the revision that authorized it.
+    static func mayPublishReplacement(
+        authorizedRevision: UInt64,
+        currentRevision: UInt64,
+        stopping: Bool,
+        candidateFailed: Bool,
+        ownsExpectedOldStream: Bool,
+        ownsPendingCandidate: Bool
+    ) -> MeetingCaptureStreamPublication {
+        guard !stopping else { return .superseded }
+        guard !Self.isSuperseded(observedRevision: authorizedRevision, currentRevision: currentRevision) else {
+            return .superseded
+        }
+        guard !candidateFailed else { return .failed }
+        guard ownsExpectedOldStream, ownsPendingCandidate else { return .superseded }
+        return .commit
+    }
+
+    /// Direct AEC3 may only be committed onto the exact producer generation it was reserved for,
+    /// while that producer is running and no rebuild owns it.
+    static func mayCommitAEC(
+        reserved: MeetingCaptureStreamOwnership,
+        current: MeetingCaptureStreamOwnership,
+        stopping: Bool,
+        rebuilding: Bool,
+        currentStreamStopped: Bool,
+        routeListenerDegraded: Bool,
+        dispositionIsSupportedSpeaker: Bool,
+        activationGeneration: UInt64,
+        reservationToken: UInt64
+    ) -> Bool {
+        guard !stopping, !rebuilding, !currentStreamStopped, !routeListenerDegraded else { return false }
+        guard dispositionIsSupportedSpeaker else { return false }
+        guard activationGeneration == reservationToken else { return false }
+        return reserved == current
+    }
+}
+
+/// Runtime authority for the pre-production direct AEC3 rollout. All build configurations honour
+/// the `FLUIDVOICE_DISABLE_AEC3` kill switch. The route classifier and installer both read this
+/// function so selection and construction cannot diverge.
+nonisolated enum MeetingDirectAEC3Availability {
+    static func isAvailable(killSwitchEngaged: Bool) -> Bool {
+        !killSwitchEngaged
+    }
+
+    static func isAvailable(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+        Self.isAvailable(
+            killSwitchEngaged: !MeetingDirectAEC3Gate.enabled(environment: environment)
+        )
+    }
+}
+
 private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCaptureRuntime, SCStreamOutput, SCStreamDelegate,
     @unchecked Sendable
 {
@@ -467,7 +569,7 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
     private static let rebuildDelays: [TimeInterval] = [0.5, 1.0, 2.0]
 
     private let application: MeetingApplicationIdentity
-    private let microphone: MeetingMicrophoneIdentity
+    private let requestedMicrophone: MeetingMicrophoneIdentity
     /// Immutable for the runtime's lifetime: a rebuild never drops/adds the mic.
     private let includeMicrophone: Bool
     private let microphoneTranscriptGate: MeetingMicrophoneTranscriptGate
@@ -475,6 +577,11 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
     private let microphoneWriter: MeetingAudioChunkWriter
     private let eventHandler: @Sendable (MeetingCaptureEvent) -> Void
     private let liveAudioHandler: (@Sendable (MeetingAudioTrackKind, CMSampleBuffer) -> Void)?
+    private let callbackQueue = DispatchQueue(
+        label: "com.fluidvoice.meeting.screencapture.samples",
+        qos: .userInteractive
+    )
+    private let callbackQueueKey = DispatchSpecificKey<UInt8>()
 #if DEBUG
     private let pairedDiagnosticCollector: MeetingSCKPairedDiagnosticCollector
     private var pairedDiagnosticProvenanceFailureReported = false
@@ -482,15 +589,37 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
 #endif
     private let stateLock = NSLock()
     private var stream: SCStream
+    /// The device actually bound into the current SCK producer epoch. The requested microphone is
+    /// retained separately so a route-driven default-input change is explicit in capture eras.
+    private var activeMicrophone: MeetingMicrophoneIdentity
     private var scope: MeetingCaptureScope
     private var delegateProxy: ScreenCaptureRuntimeDelegateProxy?
     private var stopping = false
-    private var rebuilding = false
+    /// Explicit rebuild ownership instead of a bare flag. A rebuild holds its token from the moment
+    /// it claims the producer until publication, and only the holder may release it, so a rebuild
+    /// started by a racing `didStop` can never have its ownership cleared by the loser's `defer`.
+    private var rebuildOwner: UInt64?
+    private var nextRebuildOwnerToken: UInt64 = 0
+    /// Must be read with `stateLock` held.
+    private var rebuilding: Bool { self.rebuildOwner != nil }
+    /// Unlike `rebuilding`, this records the actual ownership state of `stream`. It lets stop avoid
+    /// re-stopping a producer that was deliberately retired even if replacement construction fails.
+    private var currentStreamStopped = false
     private var pendingStream: SCStream?
     private var pendingStreamFailed = false
     private var outputRouteListener: MeetingOutputRouteListener?
+    /// Sticky: once a required CoreAudio listener is gone, later route observations are unreliable
+    /// for the rest of the session, so admission and AEC stay fail-closed.
+    private var routeListenerDegraded = false
     private var outputRouteRevision: UInt64 = 0
+    private var streamGeneration: UInt64 = 1
+    private var aecActivation = MeetingAECActivationController()
+    private var aecPipeline: MeetingAECPipeline?
+    private var retiredAECCommitters: [MeetingAECOutputCommitter] = []
+    private var routeDisposition: MeetingAECOutputRouteDisposition = .ambiguous
+    private var captureStarted = false
     private var routeSafetyPersistenceFailed = false
+    private let rebuildGroup = DispatchGroup()
     private let routeProtectionTasks = MeetingAsyncTaskChain()
 
     var captureScope: MeetingCaptureScope? {
@@ -501,7 +630,8 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
         stream: SCStream,
         scope: MeetingCaptureScope,
         application: MeetingApplicationIdentity,
-        microphone: MeetingMicrophoneIdentity,
+        requestedMicrophone: MeetingMicrophoneIdentity,
+        activeMicrophone: MeetingMicrophoneIdentity,
         includeMicrophone: Bool,
         microphoneEchoProtection: MeetingMicrophoneEchoProtection,
         applicationWriter: MeetingAudioChunkWriter,
@@ -512,7 +642,8 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
         self.stream = stream
         self.scope = scope
         self.application = application
-        self.microphone = microphone
+        self.requestedMicrophone = requestedMicrophone
+        self.activeMicrophone = activeMicrophone
         self.includeMicrophone = includeMicrophone
         self.microphoneTranscriptGate = MeetingMicrophoneTranscriptGate(
             includeMicrophone ? .unprotected : microphoneEchoProtection
@@ -525,6 +656,7 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
         self.pairedDiagnosticCollector = MeetingSCKPairedDiagnosticCollector()
 #endif
         super.init()
+        self.callbackQueue.setSpecific(key: self.callbackQueueKey, value: 1)
     }
 
     static func make(
@@ -537,19 +669,32 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
         eventHandler: @escaping @Sendable (MeetingCaptureEvent) -> Void,
         liveAudioHandler: (@Sendable (MeetingAudioTrackKind, CMSampleBuffer) -> Void)?
     ) async throws -> ScreenCaptureMeetingRuntime {
-        let resolvedMicrophone = includeMicrophone
-            ? try MeetingAVCaptureMicrophoneResolver.resolve(microphone)
+        let electedMicrophone = includeMicrophone
+            ? await MeetingCaptureDeviceElection.elect(original: microphone).identity
             : microphone
+        let resolvedMicrophone = includeMicrophone
+            ? try MeetingAVCaptureMicrophoneResolver.resolve(electedMicrophone)
+            : electedMicrophone
         let built = try await Self.buildStream(
             application: application,
             microphone: resolvedMicrophone,
             includeMicrophone: includeMicrophone
         )
+        if includeMicrophone {
+            try await microphoneWriter.updateTrackMetadata { track in
+                guard var eras = track.captureEras, !eras.isEmpty else { return }
+                eras[0].deviceUID = resolvedMicrophone.coreAudioUID
+                eras[0].deviceName = resolvedMicrophone.displayName
+                eras[0].roleAtElection = .unknown
+                track.captureEras = eras
+            }
+        }
         let runtime = ScreenCaptureMeetingRuntime(
             stream: built.stream,
             scope: built.scope,
             application: application,
-            microphone: resolvedMicrophone,
+            requestedMicrophone: microphone,
+            activeMicrophone: resolvedMicrophone,
             includeMicrophone: includeMicrophone,
             microphoneEchoProtection: microphoneEchoProtection,
             applicationWriter: applicationWriter,
@@ -641,72 +786,103 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
         try stream.addStreamOutput(
             self,
             type: .audio,
-            sampleHandlerQueue: DispatchQueue(
-                label: "com.fluidvoice.meeting.screencapture.application",
-                qos: .userInteractive
-            )
+            sampleHandlerQueue: self.callbackQueue
         )
         guard self.includeMicrophone else { return }
         try stream.addStreamOutput(
             self,
             type: .microphone,
-            sampleHandlerQueue: DispatchQueue(
-                label: "com.fluidvoice.meeting.screencapture.microphone",
-                qos: .userInteractive
-            )
+            sampleHandlerQueue: self.callbackQueue
         )
     }
 
     func start() async throws {
         var installedListener: MeetingOutputRouteListener?
         if self.includeMicrophone {
-            // Arm observation before promoting raw microphone admission. This closes the snapshot →
-            // stream-start hole: a route notification racing startup increments the revision and
-            // prevents the stale protection snapshot from opening the gate.
-            installedListener = await MeetingOutputRouteListener.make { [weak self] in
-                self?.invalidateRawMicrophoneAdmissionAfterRouteChange()
+            installedListener = await MeetingOutputRouteListener.make { [weak self] health in
+                self?.invalidateRawMicrophoneAdmissionAfterRouteChange(listenerHealth: health)
             }
             let baselineRevision = self.stateLock.withLock { () -> UInt64 in
                 self.outputRouteListener = installedListener
                 return self.outputRouteRevision
             }
-            // Listener failure degrades transcript admission, never the recording itself.
-            let protection: MeetingMicrophoneEchoProtection = installedListener == nil
-                ? .unprotected
-                : MeetingRawMicrophoneProtection.classify(MeetingCaptureEngine.currentOutputRouteSnapshot())
+            try? await Task.sleep(nanoseconds: UInt64(Self.rawRouteSettleSeconds * 1_000_000_000))
+            var firstSnapshot = MeetingCaptureEngine.currentOutputRouteSnapshot()
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            var secondSnapshot = MeetingCaptureEngine.currentOutputRouteSnapshot()
+            while firstSnapshot != secondSnapshot,
+                  self.stateLock.withLock({ self.outputRouteRevision == baselineRevision && !self.stopping })
+            {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                firstSnapshot = MeetingCaptureEngine.currentOutputRouteSnapshot()
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                secondSnapshot = MeetingCaptureEngine.currentOutputRouteSnapshot()
+            }
+            let stable = installedListener != nil && self.stateLock.withLock {
+                self.outputRouteRevision == baselineRevision && !self.stopping && !self.routeListenerDegraded
+            }
+            let disposition = MeetingAECOutputRouteClassifier.classify(
+                first: firstSnapshot,
+                second: secondSnapshot,
+                revisionStayedStable: stable,
+                debugDisabled: !Self.directAEC3Available
+            )
             do {
-                try await self.microphoneWriter.updateTrackMetadataFailClosed { track in
-                    guard var eras = track.captureEras, !eras.isEmpty else { return }
-                    eras[eras.index(before: eras.endIndex)].echoProtection = protection
-                    track.captureEras = eras
-                }
+                try await self.applySettledRouteDisposition(disposition, revision: baselineRevision)
             } catch {
                 await installedListener?.stop()
                 self.stateLock.withLock { self.outputRouteListener = nil }
                 throw error
             }
-            await self.routeProtectionTasks.drain()
-            let routeStayedStable = self.stateLock.withLock {
-                self.outputRouteRevision == baselineRevision && !self.stopping
-            }
-            if !routeStayedStable {
-                // A callback may have raced and completed before the startup metadata write. Make
-                // the final persisted state fail-closed as well as the already-closed live gate.
-                try await self.microphoneWriter.updateTrackMetadata { track in
-                    guard var eras = track.captureEras, !eras.isEmpty else { return }
-                    eras[eras.index(before: eras.endIndex)].echoProtection = .unprotected
-                    track.captureEras = eras
-                }
-            }
-            self.microphoneTranscriptGate.update(routeStayedStable ? protection : .unprotected)
         }
         let currentStream = self.stateLock.withLock { self.stream }
+        let mayStart = self.stateLock.withLock { () -> Bool in
+            guard !self.stopping else { return false }
+            return self.aecActivation.allowsInitialCaptureStart(hasCandidate: self.aecPipeline != nil)
+        }
+        guard mayStart else {
+            await installedListener?.stop()
+            throw MeetingCaptureError.captureStartFailed("The audio route changed during AEC setup.")
+        }
         do {
             try await currentStream.startCapture()
         } catch {
             await installedListener?.stop()
             self.stateLock.withLock { self.outputRouteListener = nil }
             throw MeetingCaptureError.captureStartFailed(error.localizedDescription)
+        }
+        var stalePipeline: MeetingAECPipeline?
+        var startupLostStreamOwnership = false
+        self.stateLock.withLock {
+            self.captureStarted = true
+            if !self.stopping,
+               !self.rebuilding,
+               !self.currentStreamStopped,
+               currentStream === self.stream,
+               self.aecActivation.armReadyCandidate()
+            {
+                // The controller now owns the armed/raw first-format handshake.
+            } else if self.aecPipeline != nil, self.aecActivation.state != .raw {
+                stalePipeline = self.aecPipeline
+                self.aecPipeline = nil
+                self.aecActivation.invalidate()
+            }
+            startupLostStreamOwnership = self.stopping
+                || self.currentStreamStopped
+                || currentStream !== self.stream
+        }
+        if let stalePipeline {
+            let boundary = self.microphoneTranscriptGate.invalidate()
+            self.performOnCallbackQueueSynchronously {
+                stalePipeline.invalidate(reason: .streamChanged, boundary: boundary)
+                self.retainRetiredCommitterIfPending(stalePipeline.committer)
+            }
+        }
+        if startupLostStreamOwnership {
+            try? await currentStream.stopCapture()
+            throw MeetingCaptureError.captureStartFailed(
+                "The initial capture stream lost ownership while it was starting."
+            )
         }
     }
 
@@ -719,30 +895,55 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
         defer { AudioTopologyDiagnostics.record(.phaseEnd, owner: .screenCapture, queueRole: .actorControl, phase: .screenCaptureStop) }
         #endif
         self.markStopping()
+        let boundary = self.microphoneTranscriptGate.invalidate()
         let routeListener = self.stateLock.withLock { () -> MeetingOutputRouteListener? in
             defer { self.outputRouteListener = nil }
             return self.outputRouteListener
         }
         await routeListener?.stop()
         await self.routeProtectionTasks.drain()
-        let (currentStream, streamAlreadyDead) = self.stateLock.withLock { (self.stream, self.rebuilding) }
+        let (currentStream, streamAlreadyDead) = self.stateLock.withLock { (self.stream, self.currentStreamStopped) }
         // Mid-rebuild the current stream already stopped on its own; stopCapture would only time out.
-        guard !streamAlreadyDead else { return }
-        let result = await withCheckedContinuation { continuation in
-            let completion = MeetingOneShotCompletion(continuation)
-            currentStream.stopCapture { error in
-                if let error {
-                    completion.resume(.failure(error.localizedDescription))
-                } else {
-                    completion.resume(.success)
+        var stopFailure: String?
+        if !streamAlreadyDead {
+            let result = await withCheckedContinuation { continuation in
+                let completion = MeetingOneShotCompletion(continuation)
+                currentStream.stopCapture { error in
+                    if let error {
+                        completion.resume(.failure(error.localizedDescription))
+                    } else {
+                        completion.resume(.success)
+                    }
+                }
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 3) {
+                    completion.resume(.failure("Timed out while stopping system-audio capture."))
                 }
             }
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 3) {
-                completion.resume(.failure("Timed out while stopping system-audio capture."))
+            if case let .failure(detail) = result { stopFailure = detail }
+        }
+        await withCheckedContinuation { continuation in
+            self.rebuildGroup.notify(queue: .global(qos: .userInitiated)) {
+                continuation.resume()
             }
         }
-        if case let .failure(detail) = result {
-            throw MeetingCaptureRuntimeError.stopFailed(detail)
+        var stoppedPipeline: MeetingAECPipeline?
+        self.performOnCallbackQueueSynchronously {
+            stoppedPipeline = self.stateLock.withLock { () -> MeetingAECPipeline? in
+                defer {
+                    self.aecPipeline = nil
+                    self.aecActivation.invalidate()
+                }
+                return self.aecPipeline
+            }
+            stoppedPipeline?.stop(boundary: boundary)
+        }
+        let committers = self.stateLock.withLock { () -> [MeetingAECOutputCommitter] in
+            defer { self.retiredAECCommitters.removeAll() }
+            return self.retiredAECCommitters + (stoppedPipeline.map { [$0.committer] } ?? [])
+        }
+        for committer in committers { await committer.waitForPendingCommits() }
+        if let stopFailure {
+            throw MeetingCaptureRuntimeError.stopFailed(stopFailure)
         }
     }
 
@@ -750,33 +951,329 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
         self.stateLock.withLock { self.stopping = true }
     }
 
+    private func performOnCallbackQueueSynchronously(_ operation: () -> Void) {
+        if DispatchQueue.getSpecific(key: self.callbackQueueKey) != nil {
+            operation()
+        } else {
+            self.callbackQueue.sync(execute: operation)
+        }
+    }
+
     func stream(
         _ stream: SCStream,
         didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
         of outputType: SCStreamOutputType
     ) {
-        let shouldAccept = self.stateLock.withLock { !self.stopping && stream === self.stream }
-        guard shouldAccept else { return }
+        let callbackState = self.stateLock.withLock {
+            () -> (MeetingAECActivationState, MeetingAECPipeline?, MeetingAECStreamToken)? in
+            guard !self.stopping, stream === self.stream else { return nil }
+            let identity = UInt64(UInt(bitPattern: Unmanaged.passUnretained(stream).toOpaque()))
+            return (
+                self.aecActivation.state,
+                self.aecPipeline,
+                MeetingAECStreamToken(generation: self.streamGeneration, identity: identity)
+            )
+        }
+        guard let (aecState, pipeline, streamToken) = callbackState else { return }
         switch outputType {
         case .audio:
 #if DEBUG
             self.recordPairedDiagnostic(sampleBuffer, output: .applicationAudio)
 #endif
-            self.applicationWriter.enqueue(sampleBuffer)
+            switch aecState {
+            case .active:
+                pipeline?.consumeRender(sampleBuffer, stream: streamToken)
+            case .armed:
+                self.validateArmedCallback(
+                    sampleBuffer,
+                    kind: .render,
+                    stream: stream,
+                    token: streamToken
+                )
+            case .raw, .constructing, .ready:
+                break
+            }
+            self.applicationWriter.enqueue(sampleBuffer, producerEpoch: streamToken.generation)
             self.liveAudioHandler?(.applicationAudio, sampleBuffer)
         case .microphone:
 #if DEBUG
             self.recordPairedDiagnostic(sampleBuffer, output: .microphone)
 #endif
-            self.microphoneWriter.enqueue(sampleBuffer)
-            if self.microphoneTranscriptGate.observeAndAdmit(sampleBuffer) {
-                self.liveAudioHandler?(.microphone, sampleBuffer)
+            switch aecState {
+            case .active:
+                pipeline?.consumeCapture(sampleBuffer, stream: streamToken)
+            case .armed:
+                self.validateArmedCallback(
+                    sampleBuffer,
+                    kind: .capture,
+                    stream: stream,
+                    token: streamToken
+                )
+                self.emitDirectRawMicrophone(sampleBuffer, producerEpoch: streamToken.generation)
+            case .raw, .constructing, .ready:
+                self.emitDirectRawMicrophone(sampleBuffer, producerEpoch: streamToken.generation)
             }
         case .screen:
             break
         @unknown default:
             break
         }
+    }
+
+    /// Single availability authority for this runtime. The route classifier and the AEC installer
+    /// both read it, so the classification gate and the construction gate cannot diverge.
+    private static var directAEC3Available: Bool {
+        MeetingDirectAEC3Availability.isAvailable()
+    }
+
+    private func emitDirectRawMicrophone(_ sampleBuffer: CMSampleBuffer, producerEpoch: UInt64) {
+        self.microphoneWriter.enqueue(sampleBuffer, producerEpoch: producerEpoch)
+        if self.microphoneTranscriptGate.observeAndAdmit(sampleBuffer) {
+            self.liveAudioHandler?(.microphone, sampleBuffer)
+        }
+    }
+
+    /// Armed validation callbacks stay on the raw path. Only a later callback can observe active,
+    /// guaranteeing the joiner starts with a fresh pair after both real SCK formats were accepted.
+    private func validateArmedCallback(
+        _ sampleBuffer: CMSampleBuffer,
+        kind: MeetingAECInputKind,
+        stream: SCStream,
+        token: MeetingAECStreamToken
+    ) {
+        if let failure = MeetingAECPipeline.firstFormatFailure(sampleBuffer, kind: kind, stream: token) {
+            self.deactivateAECOnCallbackQueue(reason: failure)
+            return
+        }
+        self.stateLock.withLock {
+            guard !self.stopping, stream === self.stream,
+                  case let .armed(generation, _, _) = self.aecActivation.state,
+                  generation == self.aecActivation.generation
+            else { return }
+            self.aecActivation.observeValidatedFormat(kind: kind, token: generation)
+        }
+    }
+
+    /// Must be called on `callbackQueue`; it clears the shared state before touching/destroying the
+    /// detached engine, so no later callback can acquire an object pending reset.
+    private func deactivateAECOnCallbackQueue(reason: MeetingAECFailure) {
+        let boundary = self.microphoneTranscriptGate.invalidate()
+        let detached = self.stateLock.withLock { () -> MeetingAECPipeline? in
+            self.aecActivation.invalidate()
+            defer { self.aecPipeline = nil }
+            return self.aecPipeline
+        }
+        detached?.invalidate(reason: reason, boundary: boundary)
+        if let detached { self.retainRetiredCommitterIfPending(detached.committer) }
+    }
+
+    private func applySettledRouteDisposition(
+        _ disposition: MeetingAECOutputRouteDisposition,
+        revision: UInt64
+    ) async throws {
+        let stillCurrent = self.stateLock.withLock { () -> Bool in
+            guard self.outputRouteRevision == revision, !self.stopping else { return false }
+            self.routeDisposition = disposition
+            return true
+        }
+        guard stillCurrent else { return }
+
+        switch disposition {
+        case .physicallyClosed:
+            // The gate epoch is captured before persistence so a route/lifecycle invalidation
+            // racing the write below can never be overwritten by this stale open.
+            let gateEpoch = self.microphoneTranscriptGate.invalidationEpoch
+            let start = self.microphoneTranscriptGate.latestObservedSeconds()
+            try await self.microphoneWriter.updateTrackMetadataFailClosed { track in
+                MeetingAECOutputCommitter.applyEra(
+                    to: &track,
+                    protection: .acousticallyClosed,
+                    provenance: nil,
+                    startSeconds: start
+                )
+            }
+            let mayOpen = self.stateLock.withLock {
+                self.outputRouteRevision == revision && !self.stopping
+            }
+            if mayOpen,
+               self.microphoneTranscriptGate.updateIfNotInvalidated(.acousticallyClosed, since: gateEpoch)
+            {} else {
+                // The route invalidation may have queued its conservative command before the
+                // stale optimistic write above. Append a compensating fail-closed write after it.
+                let unsafeStart = self.microphoneTranscriptGate.invalidate()?.unsafeStartSeconds
+                try await self.microphoneWriter.updateTrackMetadataFailClosed { track in
+                    MeetingAECOutputCommitter.applyEra(
+                        to: &track,
+                        protection: .unprotected,
+                        provenance: nil,
+                        startSeconds: unsafeStart
+                    )
+                }
+            }
+        case .supportedSpeaker:
+            let start = self.microphoneTranscriptGate.latestObservedSeconds()
+            try await self.microphoneWriter.updateTrackMetadataFailClosed { track in
+                MeetingAECOutputCommitter.applyEra(
+                    to: &track,
+                    protection: .unprotected,
+                    provenance: nil,
+                    startSeconds: start
+                )
+            }
+            _ = self.microphoneTranscriptGate.invalidate()
+            do {
+                try await self.installAECForSupportedSpeaker(revision: revision)
+            } catch {
+                self.eventHandler(.interrupted(
+                    kind: .microphoneChanged,
+                    trackID: self.microphoneWriter.trackID,
+                    detail: "Speaker-route AEC initialization failed; microphone remains raw and unprotected."
+                ))
+            }
+        case .ambiguous:
+            let start = self.microphoneTranscriptGate.latestObservedSeconds()
+            try await self.microphoneWriter.updateTrackMetadataFailClosed { track in
+                MeetingAECOutputCommitter.applyEra(
+                    to: &track,
+                    protection: .unprotected,
+                    provenance: nil,
+                    startSeconds: start
+                )
+            }
+            _ = self.microphoneTranscriptGate.invalidate()
+        }
+    }
+
+    private func installAECForSupportedSpeaker(revision: UInt64) async throws {
+        // Release must never construct or install direct AEC3; Debug honours the kill switch.
+        guard Self.directAEC3Available else { return }
+        // Construction is bound to one precise producer: object identity, stream generation, and
+        // the route revision that authorized it. Everything below re-checks that exact triple.
+        let reserved = self.stateLock.withLock { () -> (ownership: MeetingCaptureStreamOwnership, token: UInt64)? in
+            guard !self.stopping,
+                  !self.rebuilding,
+                  !self.currentStreamStopped,
+                  !self.routeListenerDegraded,
+                  self.outputRouteRevision == revision,
+                  self.routeDisposition == .supportedSpeaker,
+                  self.aecPipeline == nil,
+                  let token = self.aecActivation.reserveConstruction()
+            else { return nil }
+            return (self.currentStreamOwnershipLocked(), token)
+        }
+        guard let reserved else { return }
+
+        let processor: MeetingAECProcessor
+        do {
+            processor = try MeetingAECProcessor()
+        } catch {
+            self.stateLock.withLock {
+                self.aecActivation.abandonConstruction(reserved.token)
+            }
+            throw error
+        }
+        let committer = MeetingAECOutputCommitter(
+            writer: self.microphoneWriter,
+            producerEpoch: reserved.ownership.streamGeneration,
+            transcriptGate: self.microphoneTranscriptGate,
+            liveAudioHandler: self.liveAudioHandler
+        ) { [weak self] failure in
+            self?.handleAECTerminalFailure(failure)
+        }
+        let candidate = MeetingAECPipeline(processor: processor, committer: committer)
+
+        let committed = self.stateLock.withLock { () -> Bool in
+            let mayCommit = MeetingCaptureOwnershipGate.mayCommitAEC(
+                reserved: reserved.ownership,
+                current: self.currentStreamOwnershipLocked(),
+                stopping: self.stopping,
+                rebuilding: self.rebuilding,
+                currentStreamStopped: self.currentStreamStopped,
+                routeListenerDegraded: self.routeListenerDegraded,
+                dispositionIsSupportedSpeaker: self.routeDisposition == .supportedSpeaker,
+                activationGeneration: self.aecActivation.generation,
+                reservationToken: reserved.token
+            )
+            guard mayCommit, self.aecActivation.commitCandidate(reserved.token) else {
+                // The producer this engine was bound to is gone. Release the reservation so a
+                // later generation can construct again instead of being stuck `.constructing`.
+                self.aecActivation.abandonConstruction(reserved.token)
+                return false
+            }
+            self.aecPipeline = candidate
+            return true
+        }
+        // The uncommitted candidate is simply dropped: it was never published, never fed a
+        // callback, and holds no writer state.
+        guard committed else { return }
+
+        // A route-time construction has no startCapture flight. Recheck the same ownership once
+        // more and arm it; startup construction remains ready until startCapture itself returns.
+        self.stateLock.withLock {
+            guard self.captureStarted,
+                  !self.stopping,
+                  !self.rebuilding,
+                  !self.currentStreamStopped,
+                  self.outputRouteRevision == revision,
+                  self.currentStreamOwnershipLocked() == reserved.ownership,
+                  self.aecActivation.generation == reserved.token
+            else { return }
+            _ = self.aecActivation.armReadyCandidate()
+        }
+    }
+
+    /// Must be called with `stateLock` held. Pointer identity alone can repeat after a dealloc, so
+    /// it is always paired with the monotonic stream generation.
+    private func currentStreamOwnershipLocked() -> MeetingCaptureStreamOwnership {
+        MeetingCaptureStreamOwnership(
+            streamIdentity: UInt64(UInt(bitPattern: Unmanaged.passUnretained(self.stream).toOpaque())),
+            streamGeneration: self.streamGeneration,
+            routeRevision: self.outputRouteRevision
+        )
+    }
+
+    /// True while this revision is still the commit-time authority.
+    private func isCurrentRouteRevision(_ revision: UInt64) -> Bool {
+        self.stateLock.withLock {
+            MeetingCaptureOwnershipGate.shouldRunRouteProtection(
+                taskRevision: revision,
+                currentRevision: self.outputRouteRevision,
+                stopping: self.stopping
+            )
+        }
+    }
+
+    /// Must be called with `stateLock` held.
+    private func beginRebuildLocked() -> UInt64 {
+        self.nextRebuildOwnerToken &+= 1
+        self.rebuildOwner = self.nextRebuildOwnerToken
+        return self.nextRebuildOwnerToken
+    }
+
+    /// Must be called with `stateLock` held. Only the current owner may release ownership.
+    @discardableResult
+    private func endRebuildLocked(_ token: UInt64) -> Bool {
+        guard self.rebuildOwner == token else { return false }
+        self.rebuildOwner = nil
+        return true
+    }
+
+    private func handleAECTerminalFailure(_ failure: MeetingAECFailure) {
+        let shouldReport = self.stateLock.withLock { () -> Bool in
+            // An ordered user/rebuild stop already closed admission and owns the terminal event.
+            guard !self.stopping, !self.routeSafetyPersistenceFailed else { return false }
+            self.routeSafetyPersistenceFailed = true
+            self.stopping = true
+            self.aecActivation.invalidate()
+            return true
+        }
+        guard shouldReport else { return }
+        _ = self.microphoneTranscriptGate.invalidate()
+        self.eventHandler(.interrupted(
+            kind: .captureStoppedUnexpectedly,
+            trackID: self.microphoneWriter.trackID,
+            detail: "AEC microphone pipeline failed closed (\(failure.rawValue)); recording was stopped to preserve transcript safety."
+        ))
     }
 
 #if DEBUG
@@ -837,140 +1334,407 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
     }
 #endif
 
-    /// A raw ScreenCaptureKit microphone has no producer handoff. Close live admission at the
-    /// observation boundary and persist a new unprotected era from that point forward. Historical
-    /// audio remains classified by the route on which it was actually captured.
-    private func invalidateRawMicrophoneAdmissionAfterRouteChange() {
+    /// Route observation closes the live gate and publishes `.raw` synchronously. The shared SCK
+    /// queue then resets/detaches the old engine and orders the conservative era before later raw
+    /// callbacks. Settling always starts from two fresh snapshots.
+    private func invalidateRawMicrophoneAdmissionAfterRouteChange(
+        listenerHealth: MeetingOutputRouteListenerHealth = .healthy
+    ) {
         let revision = self.stateLock.withLock { () -> UInt64? in
+            if listenerHealth == .degraded { self.routeListenerDegraded = true }
             guard !self.stopping else { return nil }
             self.outputRouteRevision &+= 1
+            self.aecActivation.invalidate()
+            self.routeDisposition = .ambiguous
             return self.outputRouteRevision
         }
         guard let revision else { return }
         let boundary = self.microphoneTranscriptGate.invalidate()
+        self.performOnCallbackQueueSynchronously {
+            let detached = self.stateLock.withLock { () -> MeetingAECPipeline? in
+                defer { self.aecPipeline = nil }
+                return self.aecPipeline
+            }
+            if let detached {
+                detached.invalidate(reason: .streamChanged, boundary: boundary)
+                self.retainRetiredCommitterIfPending(detached.committer)
+            } else {
+                self.microphoneWriter.enqueueMetadata(
+                    failClosed: true,
+                    mutate: { track in
+                        MeetingAECOutputCommitter.applyEra(
+                            to: &track,
+                            protection: .unprotected,
+                            provenance: nil,
+                            startSeconds: boundary?.unsafeStartSeconds
+                        )
+                    }
+                ) { [weak self] result in
+                    if case .failure = result {
+                        self?.handleAECTerminalFailure(.metadataPersistence)
+                    }
+                }
+            }
+        }
         self.routeProtectionTasks.enqueue { [weak self] in
             guard let self else { return }
-            let invalidationPersisted: Bool
+            guard let settled = await self.settleRouteAndInput(revision: revision) else { return }
+            var disposition = settled.disposition
+            var inputDetail: String?
+            var replacementMicrophone: MeetingMicrophoneIdentity?
+            switch settled.inputTransition {
+            case .unavailable:
+                disposition = .ambiguous
+                inputDetail = "The current default microphone could not be resolved; microphone transcript admission remains disabled."
+                replacementMicrophone = self.stateLock.withLock {
+                    self.currentStreamStopped ? self.activeMicrophone : nil
+                }
+            case let .unchanged(election):
+                inputDetail = "The capture microphone remained \(election.identity.displayName)."
+                replacementMicrophone = self.stateLock.withLock {
+                    self.currentStreamStopped ? election.identity : nil
+                }
+            case let .changed(election):
+                replacementMicrophone = election.identity
+            }
+            if let replacementMicrophone {
+                guard await self.waitForInitialCaptureStart(revision: revision) else { return }
+                do {
+                    let publication = try await self.replaceStreamForRouteChange(
+                        with: replacementMicrophone,
+                        revision: revision
+                    )
+                    guard publication == .commit else { return }
+                    inputDetail = "Capture moved to the settled microphone \(replacementMicrophone.displayName)."
+                } catch {
+                    self.reportRouteReplacementFailure(error)
+                    return
+                }
+            }
             do {
-                try await self.microphoneWriter.updateTrackMetadataFailClosed { track in
-                    guard var eras = track.captureEras, !eras.isEmpty else { return }
-                    if let boundary {
-                        if boundary.unsafeStartSeconds > (eras.last?.startSeconds ?? -.infinity) {
-                            var unsafeEra = eras[eras.index(before: eras.endIndex)]
-                            unsafeEra.echoProtection = .unprotected
-                            unsafeEra.startSeconds = boundary.unsafeStartSeconds
-                            unsafeEra.settledConfig = nil
-                            unsafeEra.clockDrift = nil
-                            eras.append(unsafeEra)
-                        } else {
-                            eras[eras.index(before: eras.endIndex)].echoProtection = .unprotected
-                        }
-                    } else {
-                        // No sample boundary exists yet, but admission remains fail-closed while
-                        // the input/output route pair settles.
-                        eras[eras.index(before: eras.endIndex)].echoProtection = .unprotected
-                    }
-                    track.captureEras = eras
-                }
-                invalidationPersisted = true
+                try await self.applySettledRouteDisposition(disposition, revision: revision)
             } catch {
-                invalidationPersisted = false
-                DebugLogger.shared.warning(
-                    "Raw microphone route safety could not be persisted; transcript admission remains closed: \(error.localizedDescription)",
-                    source: "MeetingCaptureEngine"
-                )
-                let shouldEmit = self.stateLock.withLock { () -> Bool in
-                    guard !self.routeSafetyPersistenceFailed else { return false }
-                    self.routeSafetyPersistenceFailed = true
-                    self.stopping = true
-                    return true
-                }
-                if shouldEmit {
-                    self.eventHandler(.interrupted(
-                        kind: .captureStoppedUnexpectedly,
-                        trackID: self.microphoneWriter.trackID,
-                        detail: "Microphone route safety metadata could not be saved; recording was stopped fail-closed."
-                    ))
-                }
-            }
-
-            guard invalidationPersisted else { return }
-            try? await Task.sleep(nanoseconds: UInt64(Self.rawRouteSettleSeconds * 1_000_000_000))
-            let isLatestBeforeClassification = self.stateLock.withLock {
-                self.outputRouteRevision == revision && !self.stopping
-            }
-            guard isLatestBeforeClassification else { return }
-
-            let settledProtection = MeetingRawMicrophoneProtection.classify(
-                MeetingCaptureEngine.currentOutputRouteSnapshot()
-            )
-            guard settledProtection.admitsTranscript else {
-                self.eventHandler(.interrupted(
-                    kind: .microphoneChanged,
-                    trackID: self.microphoneWriter.trackID,
-                    detail: "Microphone transcript admission remains disabled because the output route is not echo-protected."
-                ))
+                self.handleAECTerminalFailure(.metadataPersistence)
                 return
-            }
-            // A nil boundary means the route changed before the first microphone buffer. In that
-            // case no historical samples can be blessed accidentally, so era zero may be updated
-            // directly after the settled route has been positively classified.
-            let resumeAt = self.microphoneTranscriptGate.invalidate()?.observedSeconds
-
-            let resumePersisted: Bool
-            var wroteResumeEra = false
-            do {
-                try await self.microphoneWriter.updateTrackMetadata { track in
-                    guard var eras = track.captureEras, !eras.isEmpty else { return }
-                    if let resumeAt {
-                        guard resumeAt > (eras.last?.startSeconds ?? -.infinity) else { return }
-                        var resumedEra = eras[eras.index(before: eras.endIndex)]
-                        resumedEra.echoProtection = settledProtection
-                        resumedEra.startSeconds = resumeAt
-                        eras.append(resumedEra)
-                    } else {
-                        eras[eras.index(before: eras.endIndex)].echoProtection = settledProtection
-                    }
-                    track.captureEras = eras
-                    wroteResumeEra = true
-                }
-                resumePersisted = wroteResumeEra
-            } catch {
-                resumePersisted = false
-                DebugLogger.shared.warning(
-                    "Settled raw microphone protection could not be persisted; transcript admission remains closed: \(error.localizedDescription)",
-                    source: "MeetingCaptureEngine"
-                )
-            }
-            let isLatestAfterPersistence = self.stateLock.withLock {
-                self.outputRouteRevision == revision && !self.stopping
-            }
-            if resumePersisted, isLatestAfterPersistence {
-                self.microphoneTranscriptGate.update(settledProtection)
             }
             self.eventHandler(.interrupted(
                 kind: .microphoneChanged,
                 trackID: self.microphoneWriter.trackID,
-                detail: resumePersisted && isLatestAfterPersistence
-                    ? "Microphone transcript admission resumed after the output route settled."
-                    : "Microphone transcript admission remains disabled after the output route changed."
+                detail: inputDetail ?? (disposition == .physicallyClosed
+                    ? "Microphone transcript admission resumed on a positively identified closed output route."
+                    : disposition == .supportedSpeaker
+                        ? "Speaker-route AEC restarted unprotected and is awaiting clock attestation and warm-up."
+                        : "Microphone transcript admission remains disabled because the output route is ambiguous.")
             ))
         }
     }
 
-    func handleStreamStop(_ stoppedStream: SCStream, error: Error) {
-        let shouldRebuild = self.stateLock.withLock { () -> Bool in
-            if stoppedStream === self.pendingStream {
-                self.pendingStreamFailed = true
-                return false
+    /// Route callbacks are live during initial AEC/stream setup. They may close admission
+    /// immediately, but must not retire the initial stream until its start flight has committed.
+    private func waitForInitialCaptureStart(revision: UInt64) async -> Bool {
+        while true {
+            let state = self.stateLock.withLock {
+                (started: self.captureStarted, stale: self.stopping || self.outputRouteRevision != revision)
             }
-            guard !self.stopping, !self.rebuilding, stoppedStream === self.stream else { return false }
-            self.rebuilding = true
+            if state.stale { return false }
+            if state.started { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    /// Requires two observations taken after the debounce delay. If CoreAudio is still converging,
+    /// retry the same revision rather than accepting a mixed pre/post-change pair.
+    private func settleRouteAndInput(
+        revision: UInt64
+    ) async -> (disposition: MeetingAECOutputRouteDisposition, inputTransition: MeetingCaptureDeviceTransition)? {
+        // Serialized stale callbacks must not each pay the debounce delay. This check also keeps a
+        // listener-health failure sticky: without a complete listener set no later observation can
+        // safely reopen transcript admission.
+        guard self.isCurrentRouteRevision(revision),
+              !self.stateLock.withLock({ self.routeListenerDegraded })
+        else { return nil }
+        let ownerBusy = self.stateLock.withLock { self.rebuilding }
+        if ownerBusy {
+            await withCheckedContinuation { continuation in
+                self.rebuildGroup.notify(queue: .global(qos: .userInitiated)) {
+                    continuation.resume()
+                }
+            }
+            guard self.isCurrentRouteRevision(revision) else { return nil }
+        }
+        var attempt = 0
+        while true {
+            guard self.isCurrentRouteRevision(revision) else { return nil }
+            let delay = attempt == 0 ? Self.rawRouteSettleSeconds : 0.25
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard self.stateLock.withLock({ self.outputRouteRevision == revision && !self.stopping }) else { return nil }
+            let first = MeetingCaptureEngine.currentOutputRouteSnapshot()
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            let second = MeetingCaptureEngine.currentOutputRouteSnapshot()
+            guard self.stateLock.withLock({ self.outputRouteRevision == revision && !self.stopping }) else { return nil }
+            guard first == second else {
+                attempt += 1
+                continue
+            }
+            let disposition = MeetingAECOutputRouteClassifier.classify(
+                first: first,
+                second: second,
+                revisionStayedStable: true,
+                debugDisabled: !Self.directAEC3Available
+            )
+            let active = self.stateLock.withLock { self.activeMicrophone }
+            let transition = await MeetingCaptureDeviceElection.transition(from: active)
+            guard self.stateLock.withLock({ self.outputRouteRevision == revision && !self.stopping }) else { return nil }
+            return (disposition, transition)
+        }
+    }
+
+    /// Performs a route-driven paired-producer handoff with a mandatory gap: the old SCK stream is
+    /// fully stopped and its callback queue drained before a replacement is built or started.
+    private func replaceStreamForRouteChange(
+        with microphone: MeetingMicrophoneIdentity,
+        revision: UInt64
+    ) async throws -> MeetingCaptureStreamPublication {
+        // An unexpected-stop rebuild can win between route settling and acquisition. Wait for its
+        // owner rather than turning that benign race into a terminal handoff failure.
+        while self.stateLock.withLock({ self.rebuilding }) {
+            guard self.isCurrentRouteRevision(revision) else { return .superseded }
+            await withCheckedContinuation { continuation in
+                self.rebuildGroup.notify(queue: .global(qos: .userInitiated)) {
+                    continuation.resume()
+                }
+            }
+        }
+
+        let acquired = self.stateLock.withLock { () -> (stream: SCStream, owner: UInt64)? in
+            guard !self.stopping, self.outputRouteRevision == revision, !self.rebuilding else { return nil }
+            let owner = self.beginRebuildLocked()
+            self.rebuildGroup.enter()
+            return (self.stream, owner)
+        }
+        guard let acquired else { return .superseded }
+        let oldStream = acquired.stream
+        let owner = acquired.owner
+        defer {
+            self.stateLock.withLock { _ = self.endRebuildLocked(owner) }
+            self.rebuildGroup.leave()
+        }
+
+        let stopResult = await Self.stopStream(oldStream)
+        guard self.isCurrentRouteRevision(revision) else { return .superseded }
+        if case let .failure(detail) = stopResult {
+            throw MeetingCaptureRuntimeError.stopFailed(detail)
+        }
+        self.stateLock.withLock {
+            if self.stream === oldStream { self.currentStreamStopped = true }
+        }
+        guard self.isCurrentRouteRevision(revision) else { return .superseded }
+        // Every callback accepted from the retiring producer has now enqueued its writer command.
+        self.performOnCallbackQueueSynchronously {}
+        async let appBoundary = self.applicationWriter.beginSplice()
+        async let microphoneBoundary = self.microphoneWriter.beginSplice()
+        _ = await appBoundary
+        let boundary = await microphoneBoundary
+        guard self.isCurrentRouteRevision(revision) else { return .superseded }
+
+        do {
+            try await self.microphoneWriter.updateTrackMetadataFailClosed { track in
+                var eras = track.captureEras ?? []
+                let start = boundary?.seconds ?? eras.last?.startSeconds ?? 0
+                let replacement = MeetingCaptureEra(
+                    method: .screenCaptureKit,
+                    deviceUID: microphone.coreAudioUID,
+                    deviceName: microphone.displayName,
+                    roleAtElection: .unknown,
+                    echoProtection: .unprotected,
+                    startSeconds: start
+                )
+                if let last = eras.last, start > last.startSeconds {
+                    eras.append(replacement)
+                } else if eras.isEmpty {
+                    eras = [replacement]
+                } else {
+                    // No samples were committed in the old era; replace its identity at the same edge.
+                    eras[eras.count - 1] = replacement
+                }
+                track.captureEras = eras
+                track.captureMethod = .screenCaptureKit
+            }
+        } catch {
+            guard self.isCurrentRouteRevision(revision) else { return .superseded }
+            throw error
+        }
+        guard self.isCurrentRouteRevision(revision) else { return .superseded }
+
+        let resolved: MeetingMicrophoneIdentity
+        let built: BuiltStream
+        do {
+            resolved = try MeetingAVCaptureMicrophoneResolver.resolve(microphone)
+            built = try await Self.buildStream(
+                application: self.application,
+                microphone: resolved,
+                includeMicrophone: self.includeMicrophone
+            )
+        } catch {
+            guard self.isCurrentRouteRevision(revision) else { return .superseded }
+            throw error
+        }
+        guard self.isCurrentRouteRevision(revision) else { return .superseded }
+        built.delegateProxy.owner = self
+        do {
+            try self.attachOutputs(to: built.stream)
+        } catch {
+            guard self.isCurrentRouteRevision(revision) else { return .superseded }
+            throw error
+        }
+        let candidateRegistered = self.stateLock.withLock { () -> Bool in
+            guard !self.stopping,
+                  self.outputRouteRevision == revision,
+                  self.rebuildOwner == owner,
+                  self.stream === oldStream
+            else { return false }
+            self.pendingStream = built.stream
+            self.pendingStreamFailed = false
             return true
         }
-        guard shouldRebuild else { return }
+        guard candidateRegistered else { return .superseded }
+        do {
+            try await built.stream.startCapture()
+        } catch {
+            self.stateLock.withLock {
+                if self.pendingStream === built.stream { self.pendingStream = nil }
+            }
+            guard self.isCurrentRouteRevision(revision) else {
+                try? await built.stream.stopCapture()
+                return .superseded
+            }
+            throw error
+        }
+
+        var publication = MeetingCaptureStreamPublication.superseded
+        self.performOnCallbackQueueSynchronously {
+            publication = self.stateLock.withLock { () -> MeetingCaptureStreamPublication in
+                let decision = MeetingCaptureOwnershipGate.mayPublishReplacement(
+                    authorizedRevision: revision,
+                    currentRevision: self.outputRouteRevision,
+                    stopping: self.stopping,
+                    candidateFailed: self.pendingStreamFailed,
+                    ownsExpectedOldStream: self.stream === oldStream && self.rebuildOwner == owner,
+                    ownsPendingCandidate: self.pendingStream === built.stream
+                )
+                guard decision == .commit else {
+                    if self.pendingStream === built.stream { self.pendingStream = nil }
+                    return decision
+                }
+                self.stream = built.stream
+                self.currentStreamStopped = false
+                self.streamGeneration &+= 1
+                self.activeMicrophone = resolved
+                self.scope = built.scope
+                self.delegateProxy = built.delegateProxy
+                self.pendingStream = nil
+                // Release transition ownership in the same critical section that publishes the
+                // candidate. A didStop callback arriving one instruction later can now claim a new
+                // rebuild instead of being discarded behind a stale `rebuilding` flag.
+                _ = self.endRebuildLocked(owner)
+                return .commit
+            }
+        }
+        guard publication == .commit else {
+            try? await built.stream.stopCapture()
+            if publication == .failed {
+                throw MeetingCaptureError.captureStartFailed("The replacement capture stream stopped before commit.")
+            }
+            return .superseded
+        }
+        return .commit
+    }
+
+    private static func stopStream(_ stream: SCStream) async -> MeetingOneShotResult {
+        await withCheckedContinuation { continuation in
+            let completion = MeetingOneShotCompletion(continuation)
+            stream.stopCapture { error in
+                if let error {
+                    completion.resume(.failure(error.localizedDescription))
+                } else {
+                    completion.resume(.success)
+                }
+            }
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 3) {
+                completion.resume(.failure("Timed out while retiring the previous capture stream."))
+            }
+        }
+    }
+
+    private func reportRouteReplacementFailure(_ error: Error) {
+        let shouldReport = self.stateLock.withLock { () -> Bool in
+            guard !self.stopping else { return false }
+            self.stopping = true
+            self.aecActivation.invalidate()
+            return true
+        }
+        guard shouldReport else { return }
+        _ = self.microphoneTranscriptGate.invalidate()
+        self.eventHandler(.interrupted(
+            kind: .captureStoppedUnexpectedly,
+            trackID: nil,
+            detail: "Audio-device handoff failed closed: \(error.localizedDescription)"
+        ))
+    }
+
+    func handleStreamStop(_ stoppedStream: SCStream, error: Error) {
+        let rebuildOwner = self.stateLock.withLock { () -> UInt64? in
+            if stoppedStream === self.pendingStream {
+                self.pendingStreamFailed = true
+                return nil
+            }
+            guard !self.stopping, !self.rebuilding, stoppedStream === self.stream else { return nil }
+            let owner = self.beginRebuildLocked()
+            self.currentStreamStopped = true
+            self.rebuildGroup.enter()
+            return owner
+        }
+        guard let rebuildOwner else { return }
+        self.invalidateAECForStreamRebuild()
         self.eventHandler(.interrupted(kind: .sourceLost, trackID: nil, detail: error.localizedDescription))
-        self.runRebuildLoop(triggeringError: error)
+        self.runRebuildLoop(triggeringError: error, stoppedStream: stoppedStream, owner: rebuildOwner)
+    }
+
+    private func invalidateAECForStreamRebuild() {
+        let shouldInvalidate = self.stateLock.withLock {
+            self.routeDisposition == .supportedSpeaker || self.aecPipeline != nil
+        }
+        guard shouldInvalidate else { return }
+        let boundary = self.microphoneTranscriptGate.invalidate()
+        self.stateLock.withLock {
+            self.aecActivation.invalidate()
+        }
+        self.performOnCallbackQueueSynchronously {
+            let detached = self.stateLock.withLock { () -> MeetingAECPipeline? in
+                defer { self.aecPipeline = nil }
+                return self.aecPipeline
+            }
+            if let detached {
+                detached.invalidate(reason: .streamChanged, boundary: boundary)
+                self.retainRetiredCommitterIfPending(detached.committer)
+            } else {
+                self.microphoneWriter.enqueueMetadata(
+                    failClosed: true,
+                    mutate: { track in
+                        MeetingAECOutputCommitter.applyEra(
+                            to: &track,
+                            protection: .unprotected,
+                            provenance: nil,
+                            startSeconds: boundary?.unsafeStartSeconds
+                        )
+                    }
+                ) { [weak self] result in
+                    if case .failure = result {
+                        self?.handleAECTerminalFailure(.metadataPersistence)
+                    }
+                }
+            }
+        }
     }
 
     /// Attempts up to `rebuildDelays.count` rebuilds of the stream, checking `stopping` before and
@@ -978,64 +1742,126 @@ private final nonisolated class ScreenCaptureMeetingRuntime: NSObject, MeetingCa
     /// the stream reference is swapped under the lock and writers keep running untouched (they rotate
     /// chunks on the PTS gap on their own). On exhaustion this reports the terminal failure exactly as
     /// the non-recoverable path did before this change.
-    private func runRebuildLoop(triggeringError: Error) {
+    private func runRebuildLoop(triggeringError: Error, stoppedStream: SCStream, owner: UInt64) {
+        let rebuildGroup = self.rebuildGroup
         Task { [weak self] in
+            defer {
+                if let self {
+                    self.stateLock.withLock { _ = self.endRebuildLocked(owner) }
+                }
+                rebuildGroup.leave()
+            }
             guard let self else { return }
             var lastError = triggeringError
             for delay in Self.rebuildDelays {
-                if self.stateLock.withLock({ self.stopping }) { self.finishRebuilding(); return }
+                let mayContinue = self.stateLock.withLock {
+                    !self.stopping && self.rebuildOwner == owner
+                }
+                guard mayContinue else { return }
                 try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-                if self.stateLock.withLock({ self.stopping }) { self.finishRebuilding(); return }
+                guard self.stateLock.withLock({ !self.stopping && self.rebuildOwner == owner }) else { return }
 
                 do {
+                    let microphone = self.stateLock.withLock { self.activeMicrophone }
                     let built = try await Self.buildStream(
-                        application: self.application, microphone: self.microphone, includeMicrophone: self.includeMicrophone
+                        application: self.application, microphone: microphone, includeMicrophone: self.includeMicrophone
                     )
-                    if self.stateLock.withLock({ self.stopping }) { self.finishRebuilding(); return }
+                    guard self.stateLock.withLock({ !self.stopping && self.rebuildOwner == owner }) else { return }
                     built.delegateProxy.owner = self
                     try self.attachOutputs(to: built.stream)
-                    self.stateLock.withLock {
+                    let candidateRegistered = self.stateLock.withLock { () -> Bool in
+                        guard !self.stopping,
+                              self.rebuildOwner == owner,
+                              self.stream === stoppedStream
+                        else { return false }
                         self.pendingStream = built.stream
                         self.pendingStreamFailed = false
-                    }
-                    try await built.stream.startCapture()
-
-                    let swapped = self.stateLock.withLock { () -> Bool in
-                        defer { self.pendingStream = nil }
-                        guard !self.stopping, !self.pendingStreamFailed else { return false }
-                        self.stream = built.stream
-                        self.scope = built.scope
-                        self.delegateProxy = built.delegateProxy
-                        self.rebuilding = false
                         return true
                     }
-                    guard swapped else {
-                        try? await built.stream.stopCapture()
-                        if self.stateLock.withLock({ self.stopping }) {
-                            self.finishRebuilding()
-                            return
+                    guard candidateRegistered else { return }
+                    try await built.stream.startCapture()
+
+                    let publication = self.stateLock.withLock { () -> MeetingCaptureStreamPublication in
+                        let decision = MeetingCaptureOwnershipGate.mayPublishReplacement(
+                            authorizedRevision: self.outputRouteRevision,
+                            currentRevision: self.outputRouteRevision,
+                            stopping: self.stopping,
+                            candidateFailed: self.pendingStreamFailed,
+                            ownsExpectedOldStream: self.stream === stoppedStream && self.rebuildOwner == owner,
+                            ownsPendingCandidate: self.pendingStream === built.stream
+                        )
+                        guard decision == .commit else {
+                            if self.pendingStream === built.stream { self.pendingStream = nil }
+                            return decision
                         }
+                        self.stream = built.stream
+                        self.currentStreamStopped = false
+                        self.streamGeneration &+= 1
+                        self.scope = built.scope
+                        self.delegateProxy = built.delegateProxy
+                        self.pendingStream = nil
+                        _ = self.endRebuildLocked(owner)
+                        return .commit
+                    }
+                    guard publication == .commit else {
+                        try? await built.stream.stopCapture()
+                        if publication == .superseded { return }
                         continue
                     }
-                    self.eventHandler(.interrupted(kind: .sourceRecovered, trackID: nil, detail: nil))
+                    let committedOwnership = self.stateLock.withLock { self.currentStreamOwnershipLocked() }
+                    let shouldRearmAEC = self.stateLock.withLock {
+                        self.routeDisposition == .supportedSpeaker
+                            && !self.stopping
+                            && !self.rebuilding
+                            && !self.currentStreamStopped
+                            && self.currentStreamOwnershipLocked() == committedOwnership
+                    }
+                    if shouldRearmAEC {
+                        do {
+                            try await self.installAECForSupportedSpeaker(revision: committedOwnership.routeRevision)
+                        } catch {
+                            self.eventHandler(.interrupted(
+                                kind: .microphoneChanged,
+                                trackID: self.microphoneWriter.trackID,
+                                detail: "Speaker-route AEC could not restart after stream recovery; microphone remains unprotected."
+                            ))
+                        }
+                    }
+                    let stillRecovered = self.stateLock.withLock {
+                        !self.stopping
+                            && !self.rebuilding
+                            && !self.currentStreamStopped
+                            && self.currentStreamOwnershipLocked() == committedOwnership
+                    }
+                    if stillRecovered {
+                        self.eventHandler(.interrupted(kind: .sourceRecovered, trackID: nil, detail: nil))
+                    }
                     return
                 } catch {
-                    self.stateLock.withLock { self.pendingStream = nil }
+                    self.stateLock.withLock {
+                        if self.pendingStream != nil { self.pendingStream = nil }
+                    }
                     lastError = error
                     continue
                 }
             }
-            self.reportRebuildExhausted(triggeringError: lastError)
+            self.reportRebuildExhausted(triggeringError: lastError, owner: owner)
         }
     }
 
-    private func finishRebuilding() {
-        self.stateLock.withLock { self.rebuilding = false }
+    /// Keeps only committers that still have writer completions outstanding. Route churn cannot
+    /// therefore grow this array monotonically over a long meeting.
+    private func retainRetiredCommitterIfPending(_ committer: MeetingAECOutputCommitter) {
+        self.stateLock.withLock {
+            self.retiredAECCommitters.removeAll { !$0.hasPendingCommits }
+            if committer.hasPendingCommits { self.retiredAECCommitters.append(committer) }
+        }
     }
 
-    private func reportRebuildExhausted(triggeringError: Error) {
+    private func reportRebuildExhausted(triggeringError: Error, owner: UInt64) {
         let shouldReport = self.stateLock.withLock { () -> Bool in
-            self.rebuilding = false
+            guard self.rebuildOwner == owner else { return false }
+            _ = self.endRebuildLocked(owner)
             guard !self.stopping else { return false }
             self.stopping = true
             return true
@@ -1863,6 +2689,19 @@ nonisolated enum MeetingCapturePathDecision: Sendable, Equatable {
     case screenCaptureKit(reason: String)
 }
 
+/// Pre-production builds exercise direct AEC3 by default on a positively classified built-in-
+/// speaker route. The escape hatch is intentionally fail-closed and also prevents
+/// `ScreenCaptureMeetingRuntime` from constructing AEC3 if selection reaches it through another
+/// path.
+nonisolated enum MeetingDirectAEC3Gate {
+    // TODO: Remove this escape hatch once direct AEC3 has completed real-meeting testing and is stable.
+    static let disableEnvironmentKey = "FLUIDVOICE_DISABLE_AEC3"
+
+    static func enabled(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+        environment[Self.disableEnvironmentKey] != "1"
+    }
+}
+
 nonisolated enum MeetingCaptureTransitionPolicy {
     static let allowsWithinSessionVoiceProcessingUpgrade = true
     static let maximumRouteRecoveryAttempts = 3
@@ -2109,6 +2948,9 @@ final nonisolated class MeetingMicrophoneTranscriptGate: @unchecked Sendable {
     private let lock = NSLock()
     private var protection: MeetingMicrophoneEchoProtection
     private var latestPresentationSeconds: Double?
+    /// Bumped by every `invalidate()`. A promotion captured before a route/lifecycle close can
+    /// then never reopen admission afterwards, even if it wins the lock race against the close.
+    private var invalidationCounter: UInt64 = 0
 
     init(_ protection: MeetingMicrophoneEchoProtection = .unprotected) {
         self.protection = protection
@@ -2116,6 +2958,20 @@ final nonisolated class MeetingMicrophoneTranscriptGate: @unchecked Sendable {
 
     func update(_ protection: MeetingMicrophoneEchoProtection) {
         self.lock.withLock { self.protection = protection }
+    }
+
+    var invalidationEpoch: UInt64 {
+        self.lock.withLock { self.invalidationCounter }
+    }
+
+    /// Opens admission only when no invalidation has landed since `epoch` was captured.
+    @discardableResult
+    func updateIfNotInvalidated(_ protection: MeetingMicrophoneEchoProtection, since epoch: UInt64) -> Bool {
+        self.lock.withLock {
+            guard self.invalidationCounter == epoch else { return false }
+            self.protection = protection
+            return true
+        }
     }
 
     func admitsTranscript() -> Bool {
@@ -2148,6 +3004,7 @@ final nonisolated class MeetingMicrophoneTranscriptGate: @unchecked Sendable {
     func invalidate() -> InvalidationBoundary? {
         self.lock.withLock {
             self.protection = .unprotected
+            self.invalidationCounter &+= 1
             return self.latestPresentationSeconds.map { observed in
                 InvalidationBoundary(
                     unsafeStartSeconds: max(0, observed - Self.routeNotificationSafetySeconds),
@@ -2195,12 +3052,15 @@ final nonisolated class MeetingAsyncTaskChain: @unchecked Sendable {
 nonisolated enum MeetingCapturePathDecider {
     static let diagnosticForceScreenCaptureKitReason =
         "DEBUG C2 diagnostic forced paired ScreenCaptureKit; not a production fallback."
+    static let directAEC3DefaultReason =
+        "DEBUG direct AEC3 selected for the built-in-speaker pre-production path."
 
     static func decide(
         mode: MeetingCaptureMode,
         microphone: MeetingMicrophoneIdentity,
         outputRoute: MeetingOutputRouteSnapshot,
-        forcePairedScreenCaptureKit: Bool = false
+        forcePairedScreenCaptureKit: Bool = false,
+        preferDirectAEC3: Bool = false
     ) -> MeetingCapturePathDecision {
         guard mode == .onlineCall else {
             return .screenCaptureKit(reason: "Voice-processing capture only applies to online-call recordings.")
@@ -2216,6 +3076,9 @@ nonisolated enum MeetingCapturePathDecider {
             return .screenCaptureKit(reason: Self.diagnosticForceScreenCaptureKitReason)
         }
 #endif
+        if preferDirectAEC3 {
+            return .screenCaptureKit(reason: Self.directAEC3DefaultReason)
+        }
         return .voiceProcessing
     }
 
@@ -2363,7 +3226,7 @@ private actor MeetingOutputRouteListener {
         case ready
     }
 
-    private let onChange: @Sendable () -> Void
+    private let onChange: @Sendable (MeetingOutputRouteListenerHealth) -> Void
     private var generation: UInt64 = 0
     private var dataSourceEpoch: UInt64 = 0
     private var active = false
@@ -2377,11 +3240,13 @@ private actor MeetingOutputRouteListener {
     private var dataSourceToken: AudioObjectPropertyListenerBlock?
     private var dataSourceDeviceID: AudioObjectID?
 
-    private init(onChange: @escaping @Sendable () -> Void) {
+    private init(onChange: @escaping @Sendable (MeetingOutputRouteListenerHealth) -> Void) {
         self.onChange = onChange
     }
 
-    static func make(onChange: @escaping @Sendable () -> Void) async -> MeetingOutputRouteListener? {
+    static func make(
+        onChange: @escaping @Sendable (MeetingOutputRouteListenerHealth) -> Void
+    ) async -> MeetingOutputRouteListener? {
         let listener = MeetingOutputRouteListener(onChange: onChange)
         guard await listener.start() else { return nil }
         return listener
@@ -2514,11 +3379,13 @@ private actor MeetingOutputRouteListener {
 
     private func handleDefaultInputChanged(generation: UInt64) {
         guard self.isCurrent(generation) else { return }
+        // Admission invalidation is the first owner-visible effect of a HAL notification. Listener
+        // maintenance may await slow CoreAudio remove/add calls after this point.
+        self.onChange(.healthy)
         guard self.lifecycle == .ready else {
             self.defaultInputDirty = true
             return
         }
-        self.onChange()
     }
 
     private func attachDataSourceListener(generation: UInt64) async -> Bool {
@@ -2578,24 +3445,28 @@ private actor MeetingOutputRouteListener {
 
     private func handleDefaultOutputChanged(generation: UInt64) async {
         guard self.isCurrent(generation) else { return }
+        self.onChange(.healthy)
         guard self.lifecycle == .ready else {
             self.defaultOutputDirty = true
             return
         }
         await self.detachDataSourceListener()
         guard self.isCurrent(generation) else { return }
-        _ = await self.attachDataSourceListener(generation: generation)
+        guard await self.attachDataSourceListener(generation: generation) else {
+            if self.isCurrent(generation) { self.onChange(.degraded) }
+            return
+        }
         guard self.isCurrent(generation) else { return }
-        self.onChange()
     }
 
     private func handleDataSourceChanged(generation: UInt64, epoch: UInt64) {
         guard self.isCurrent(generation), self.dataSourceEpoch == epoch else { return }
-        self.onChange()
+        self.onChange(.healthy)
     }
 
     private func handleServiceRestart(generation: UInt64) async {
         guard self.isCurrent(generation) else { return }
+        self.onChange(.healthy)
         guard self.lifecycle == .ready else {
             self.serviceRestartDirty = true
             return
@@ -2615,14 +3486,10 @@ private actor MeetingOutputRouteListener {
             if self.isCurrent(replacementGeneration) {
                 await self.stop()
             }
-            self.onChange()
+            self.onChange(.degraded)
             return
         }
-        if await self.finishStarting(generation: replacementGeneration),
-           self.generation == replacementGeneration
-        {
-            self.onChange()
-        }
+        _ = await self.finishStarting(generation: replacementGeneration)
     }
 
     /// Listener callbacks may arrive after HAL installs a token but before the async add
@@ -2777,6 +3644,45 @@ nonisolated struct MeetingCaptureDeviceElection: Sendable, Equatable {
         )
     }
 
+    static func transition(from active: MeetingMicrophoneIdentity) async -> MeetingCaptureDeviceTransition {
+        let snapshot = await MeetingCaptureSourceCatalog.microphoneSnapshot()
+        return Self.decideTransition(
+            from: active,
+            catalog: snapshot.identities,
+            defaultInputUID: snapshot.defaultCoreAudioUID
+        )
+    }
+
+    /// Route notifications are not proof that the input changed. A missing or unmatched system
+    /// default is explicitly unavailable so callers stay fail-closed instead of silently rebinding
+    /// the originally requested device.
+    static func decideTransition(
+        from active: MeetingMicrophoneIdentity,
+        catalog: [MeetingMicrophoneIdentity],
+        defaultInputUID: String?
+    ) -> MeetingCaptureDeviceTransition {
+        guard let defaultInputUID,
+              let matched = catalog.first(where: { $0.coreAudioUID == defaultInputUID })
+        else { return .unavailable }
+        let election = Self.decide(
+            original: active,
+            catalog: catalog,
+            defaultInputUID: defaultInputUID
+        )
+        let samePhysicalDevice: Bool
+        if let activeUID = active.coreAudioUID, !activeUID.isEmpty,
+           let electedUID = election.identity.coreAudioUID, !electedUID.isEmpty
+        {
+            samePhysicalDevice = activeUID == electedUID
+        } else {
+            samePhysicalDevice = active.captureDeviceID == election.identity.captureDeviceID
+        }
+        // `matched` is intentionally referenced through `decide`; it proves the default was in the
+        // current catalog rather than a stale UID that happened to resemble the active identity.
+        _ = matched
+        return samePhysicalDevice ? .unchanged(election) : .changed(election)
+    }
+
     /// Pure decision extracted from `elect(original:)` for hardware-free testing.
     static func decide(
         original: MeetingMicrophoneIdentity,
@@ -2818,6 +3724,12 @@ nonisolated struct MeetingCaptureDeviceElection: Sendable, Equatable {
             role: .unknown
         )
     }
+}
+
+nonisolated enum MeetingCaptureDeviceTransition: Sendable, Equatable {
+    case unchanged(MeetingCaptureDeviceElection)
+    case changed(MeetingCaptureDeviceElection)
+    case unavailable
 }
 
 /// Owns a swappable mic component (VPIO or AVCaptureSession) plus an app-audio-only SCStream that never stops across a swap.
@@ -3179,9 +4091,14 @@ private final nonisolated class VoiceProcessingMeetingRuntime: MeetingCaptureRun
 
     /// Registered once: `handleRouteChange()` re-reads `phase` on every fire, so it never needs re-arming.
     private func startOutputRouteWatch() async {
-        let listener = await MeetingOutputRouteListener.make { [weak self] in
-            self?.handleRouteChange()
+        let listener = await MeetingOutputRouteListener.make { [weak self] health in
+            if health == .degraded {
+                self?.handleOutputRouteListenerFailure()
+            } else {
+                self?.handleRouteChange()
+            }
         }
+        if listener == nil { self.handleOutputRouteListenerFailure() }
         let retained = self.stateLock.withLock { () -> Bool in
             guard !self.stopRequested else { return false }
             self.outputRouteListener = listener
@@ -3190,6 +4107,27 @@ private final nonisolated class VoiceProcessingMeetingRuntime: MeetingCaptureRun
         if !retained {
             await listener?.stop()
         }
+    }
+
+    private func handleOutputRouteListenerFailure() {
+        let boundary = self.transcriptGate.invalidate()
+        let shouldEmit = self.stateLock.withLock { () -> Bool in
+            guard !self.stopRequested,
+                  self.phase != .failed,
+                  !self.routeSafetyPersistenceFailed
+            else { return false }
+            self.routeSafetyPersistenceFailed = true
+            self.phase = .failed
+            self.interruptedThisEra = true
+            return true
+        }
+        guard shouldEmit else { return }
+        self.persistRouteInvalidation(boundary)
+        self.eventHandler(.interrupted(
+            kind: .captureStoppedUnexpectedly,
+            trackID: self.microphoneWriter.trackID,
+            detail: "Core Audio route observation became unavailable; microphone transcription stopped fail-closed."
+        ))
     }
 
     private func handleRouteChange() {

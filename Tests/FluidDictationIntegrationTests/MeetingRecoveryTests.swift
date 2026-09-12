@@ -449,6 +449,43 @@ final class MeetingRecoveryTests: XCTestCase {
         XCTAssertEqual(loadedChunk?.sha256, "")
     }
 
+    func testInvalidCrashWindowTrackManifestDoesNotMakeValidSessionSnapshotUnloadable() async throws {
+        let dir = self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = MeetingSessionStore(rootDirectory: dir)
+
+        let validTrack = self.makeMicrophoneTrack(chunks: [])
+        let session = self.makeSession(state: .interrupted, endedAt: Date(), audioTracks: [validTrack])
+        try await store.create(session)
+
+        var invalidTrack = validTrack
+        invalidTrack.chunks = [MeetingAudioChunk(
+            id: UUID(),
+            sequence: 0,
+            relativeFilePath: "tracks/microphone/invalid.m4a",
+            presentationStart: MeetingMediaTime(value: 2_000, timescale: 1_000),
+            presentationEnd: MeetingMediaTime(value: 1_000, timescale: 1_000),
+            discontinuities: [],
+            sha256: "invalid",
+            byteCount: 1,
+            finalizationState: .finalized
+        )]
+        let sessionDirectory = try await store.sessionDirectory(for: session.id)
+        let manifestDirectory = sessionDirectory.appendingPathComponent("tracks/microphone", isDirectory: true)
+        try FileManager.default.createDirectory(at: manifestDirectory, withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(invalidTrack).write(
+            to: manifestDirectory.appendingPathComponent("track.json", isDirectory: false)
+        )
+
+        let loadedValue = try await store.load(id: session.id)
+        let loaded = try XCTUnwrap(loadedValue)
+        XCTAssertEqual(loaded.id, session.id)
+        XCTAssertEqual(loaded.audioTracks.first?.id, validTrack.id)
+        XCTAssertEqual(loaded.audioTracks.first?.chunks, [])
+    }
+
     // MARK: - Test 7: pre-slice JSON without recoveryResolvedAt decodes
 
     func testPreSliceSessionJSONWithoutResolvedAtDecodes() async throws {

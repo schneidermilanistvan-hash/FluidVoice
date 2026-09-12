@@ -459,6 +459,15 @@ nonisolated public struct MeetingReferenceSynchronizer: Sendable {
             let referenceSourceTime = refGrid.sourceTimes[range].compactMap { $0 }.first
             let microphoneSampleTime = micGrid.microphoneSampleTimes[range].compactMap { $0 }.first
             let microphoneHostTime = micGrid.microphoneHostTimes[range].compactMap { $0 }.first
+            let resynchronizationBoundary = resyncEvents.contains(frameIndex)
+#if DEBUG
+            let coverageIncomplete = !micMask.allSatisfy { $0 } || !refMask.allSatisfy { $0 }
+            let adaptationFrozen = anySynth || coverageIncomplete || resynchronizationBoundary
+#else
+            // The Stage 0.5 adapter behavior is deliberately absent from Release until a
+            // later production integration phase is separately reviewed and authorized.
+            let adaptationFrozen = anySynth
+#endif
             let lag: Double? = {
                 guard !anySynth else { return nil }
                 guard micSourceTime != nil, referenceSourceTime != nil else { return nil }
@@ -475,7 +484,8 @@ nonisolated public struct MeetingReferenceSynchronizer: Sendable {
                 index: frameIndex, sessionStartTime: start - firstTime, sessionEndTime: end - firstTime,
                 epochID: epoch, renderSamples: refValues, captureSamples: micValues,
                 renderValidMask: refMask, captureValidMask: micMask, unknownReasons: reasons,
-                adaptationFrozen: anySynth, resynchronizationBoundary: resyncEvents.contains(frameIndex), lagSeconds: lag,
+                adaptationFrozen: adaptationFrozen,
+                resynchronizationBoundary: resynchronizationBoundary, lagSeconds: lag,
                 timelines: MeetingSynchronizerFrameTimelines(
                     microphoneSourceTime: micSourceTime,
                     microphoneSampleTime: microphoneSampleTime,
@@ -507,14 +517,36 @@ nonisolated public struct MeetingReferenceSynchronizer: Sendable {
         var synthesizedFrameCount: Int
 
         func hasInternalGap(in range: Range<Double>) -> Bool {
-            gapRanges.contains { $0.lowerBound < range.upperBound && $0.upperBound > range.lowerBound }
+#if DEBUG
+            // Treat ranges that only meet at a boundary as disjoint. Callback PTS and
+            // fixed analysis-hop arithmetic can differ by a few binary floating-point
+            // ulps; without the epsilon, the first fully covered hop after a gap can be
+            // mislabeled as still containing that gap.
+            gapRanges.contains {
+                $0.lowerBound < range.upperBound - 1e-9
+                    && $0.upperBound > range.lowerBound + 1e-9
+            }
+#else
+            return gapRanges.contains {
+                $0.lowerBound < range.upperBound && $0.upperBound > range.lowerBound
+            }
+#endif
         }
 
         func hasSynthesized(in range: Range<Double>) -> Bool {
+#if DEBUG
             segments.contains { segment in
-                segment.synthesized && segment.start < range.upperBound
-                    && segment.start + Double(segment.values.count) / segment.sessionSampleRate > range.lowerBound
+                segment.synthesized && segment.start < range.upperBound - 1e-9
+                    && segment.start + Double(segment.values.count) / segment.sessionSampleRate
+                        > range.lowerBound + 1e-9
             }
+#else
+            return segments.contains { segment in
+                segment.synthesized && segment.start < range.upperBound
+                    && segment.start + Double(segment.values.count) / segment.sessionSampleRate
+                        > range.lowerBound
+            }
+#endif
         }
     }
 
@@ -544,7 +576,7 @@ nonisolated public struct MeetingReferenceSynchronizer: Sendable {
         var seen = Set<Int>()
         var epochEvents: [Double] = []
         var gaps: [Range<Double>] = []
-        var synthEvents: [Double] = []
+        var resynchronizationEvents: [Double] = []
         var synthCount = 0
         var previousSequence: Int?
         var previousSampleTime: Int64?
@@ -666,7 +698,7 @@ nonisolated public struct MeetingReferenceSynchronizer: Sendable {
                     appendGap(previousEnd..<sourceStart, to: &gaps)
                 }
                 appendEpochEvent(sourceStart, to: &epochEvents)
-                synthEvents.append(sourceStart)
+                resynchronizationEvents.append(sourceStart)
             }
             let expected = previousSampleTime.flatMap { safeInt64Delta(frame.sampleTime, $0) }
             // A rejected pre-origin frame may supply a timing cursor, but with no
@@ -678,13 +710,19 @@ nonisolated public struct MeetingReferenceSynchronizer: Sendable {
                 || previousRoute != nil && frame.routeIdentifier != previousRoute!
                 || (previousHost != nil && frame.hostTime != nil && frame.hostTime! <= previousHost!) {
                 appendEpochEvent(sourceStart, to: &epochEvents)
+                // Any microphone timing/route discontinuity requires the AEC-facing
+                // consumer to reset before it can use samples in the new epoch. This is
+                // independent of whether the discontinuity also contains a coverage gap.
+#if DEBUG
+                resynchronizationEvents.append(sourceStart)
+#endif
                 let previousEnd = normalized.last.map { $0.start + Double($0.values.count) / $0.frame.sampleRate } ?? sourceStart
                 if sourceStart > previousEnd { appendGap(previousEnd..<sourceStart, to: &gaps) }
             }
             let validHost = frame.hostTime.map(finite) ?? false
             let synthesized = !validHost
             if validHost && hadSynthesized {
-                synthEvents.append(sourceStart)
+                resynchronizationEvents.append(sourceStart)
                 appendEpochEvent(sourceStart, to: &epochEvents)
                 hadSynthesized = false
             }
@@ -703,7 +741,7 @@ nonisolated public struct MeetingReferenceSynchronizer: Sendable {
             sourceSampleTime: $0.sourceSampleTime, hostTime: $0.hostTime,
             sourceSampleRate: $0.frame.sampleRate, sessionSampleRate: $0.frame.sampleRate, timelineScale: 1,
             values: $0.values, synthesized: $0.synthesized) }
-        return makeTrackGrid(segments: segments, sourceOrigin: normalized.first?.sourceStart, firstTime: normalized.map { $0.start }.min(), epochEvents: epochEvents, resynchronizationEvents: synthEvents, gaps: gaps, synthesizedFrameCount: synthCount)
+        return makeTrackGrid(segments: segments, sourceOrigin: normalized.first?.sourceStart, firstTime: normalized.map { $0.start }.min(), epochEvents: epochEvents, resynchronizationEvents: resynchronizationEvents, gaps: gaps, synthesizedFrameCount: synthCount)
     }
 
     private func buildReferenceTrack(_ frames: [MeetingReferencePCMFrame], dropped: inout Int, duplicateOrLate: inout Int, nonFinite: inout Int) -> TrackGrid {
@@ -851,6 +889,9 @@ nonisolated public struct MeetingReferenceSynchronizer: Sendable {
                 } ?? start
                 if !sequenceGapDetected && (frame.discontinuity || (previousRate != nil && frame.sampleRate != previousRate!)) {
                     appendEpochEvent(start, to: &epochEvents)
+#if DEBUG
+                    resyncEvents.append(start)
+#endif
                 }
                 // A reset marker and a measured positive timing hole are independent:
                 // a route/rate/discontinuity transition can be contiguous (the common
@@ -859,6 +900,9 @@ nonisolated public struct MeetingReferenceSynchronizer: Sendable {
                 if !sequenceGapDetected && start > previousEnd + 1e-9 {
                     appendEpochEvent(start, to: &epochEvents)
                     appendGap(previousEnd..<start, to: &gaps)
+#if DEBUG
+                    resyncEvents.append(start)
+#endif
                 }
             }
             previousPTS = frame.presentationTime
