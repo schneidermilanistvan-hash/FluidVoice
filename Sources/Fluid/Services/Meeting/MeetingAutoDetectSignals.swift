@@ -853,6 +853,8 @@ nonisolated enum MeetingStorageReadiness {
               let capacity = try? applicationSupport.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
                   .volumeAvailableCapacityForImportantUsage
         else { return false }
-        return capacity >= 512 * 1024 * 1024
+        // Auto-detection can arm an online-call capture, so budget for the largest supported
+        // topology until the user chooses an explicit in-room mode.
+        return capacity >= MeetingPCMStoragePolicy.requiredFreeBytes(trackCount: 2)
     }
 }

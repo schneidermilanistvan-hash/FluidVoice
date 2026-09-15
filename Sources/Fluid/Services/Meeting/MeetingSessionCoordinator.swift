@@ -133,36 +133,45 @@ final class MeetingSessionCoordinator: ObservableObject {
     private var startReservation: UUID? {
         willSet { if (newValue != nil) != (self.startReservation != nil) { self.objectWillChange.send() } }
     }
+
     private var liveTranscriptionCoordinator: MeetingLiveTranscriptionCoordinator?
     private var captureGeneration: UUID?
     private var operationGeneration: UUID?
     private var stopTask: Task<MeetingSession, Error>? {
         willSet { if (newValue == nil) != (self.stopTask == nil) { self.objectWillChange.send() } }
     }
+
     private var interruptionTask: Task<Void, Never>?
     private var terminationTask: Task<Void, Never>?
     private var retryTask: Task<MeetingSession, Error>? {
         willSet { if (newValue == nil) != (self.retryTask == nil) { self.objectWillChange.send() } }
     }
+
     private var persistenceTail: Task<Void, Never>?
     private var persistenceGeneration = 0
     private var restoreTask: Task<Void, Never>?
     private var isDeleting = false {
         willSet { if newValue != self.isDeleting { self.objectWillChange.send() } }
     }
+
     private var isMutatingSession = false {
         willSet { if newValue != self.isMutatingSession { self.objectWillChange.send() } }
     }
+
     private var sweepPending = false
     private var retentionTimerTask: Task<Void, Never>?
 
     private enum TranscriptCorrection {
         case rename(speakerID: SessionSpeakerID, previousName: String)
         case reassign(segmentID: MeetingTranscriptSegmentID, previousSpeakerID: SessionSpeakerID?, previousRevision: Int)
-        case merge(sourceID: SessionSpeakerID, targetID: SessionSpeakerID,
-                   movedSegments: [(id: MeetingTranscriptSegmentID, previousRevision: Int)])
+        case merge(
+            sourceID: SessionSpeakerID,
+            targetID: SessionSpeakerID,
+            movedSegments: [(id: MeetingTranscriptSegmentID, previousRevision: Int)]
+        )
         case renameBatch([(speakerID: SessionSpeakerID, previousName: String)])
     }
+
     private var correctionUndoStacks: [MeetingSessionID: [TranscriptCorrection]] = [:]
     private static let correctionUndoStackCap = 50
 
@@ -193,7 +202,9 @@ final class MeetingSessionCoordinator: ObservableObject {
         }
     }
 
-    var hasPendingStart: Bool { self.startReservation != nil }
+    var hasPendingStart: Bool {
+        self.startReservation != nil
+    }
 
     /// A recovery offer is not audio ownership. Only matching terminal states may
     /// be displaced; preparing/stopping and inconsistent states remain blocked.
@@ -364,7 +375,8 @@ final class MeetingSessionCoordinator: ObservableObject {
             guard self.startReservation == reservation,
                   self.activeSession?.id == passiveOffer?.id,
                   !self.hasBlockingActivityTaskExceptStart,
-                  self.canBeginNewRecording, !self.isDeleting, !self.isMutatingSession else {
+                  self.canBeginNewRecording, !self.isDeleting, !self.isMutatingSession
+            else {
                 throw CancellationError()
             }
         } catch {
@@ -444,7 +456,8 @@ final class MeetingSessionCoordinator: ObservableObject {
             self.state = .recording(session.id)
             try await self.store.save(session)
             guard self.startReservation == reservation,
-                  self.operationGeneration == generation, !Task.isCancelled else {
+                  self.operationGeneration == generation, !Task.isCancelled
+            else {
                 throw CancellationError()
             }
             if let resolvingSourceID {
@@ -452,12 +465,14 @@ final class MeetingSessionCoordinator: ObservableObject {
                 // Record Again resolution against queued corrections/deletes.
                 await self.flushQueuedPersistence()
                 guard self.startReservation == reservation,
-                      self.operationGeneration == generation, !Task.isCancelled else {
+                      self.operationGeneration == generation, !Task.isCancelled
+                else {
                     throw CancellationError()
                 }
                 if var source = try? await self.store.load(id: resolvingSourceID) {
                     guard self.startReservation == reservation,
-                          self.operationGeneration == generation, !Task.isCancelled else {
+                          self.operationGeneration == generation, !Task.isCancelled
+                    else {
                         throw CancellationError()
                     }
                     source.recoveryResolvedAt = Date()
@@ -470,7 +485,8 @@ final class MeetingSessionCoordinator: ObservableObject {
                 }
             }
             guard self.startReservation == reservation,
-                  self.operationGeneration == generation, !Task.isCancelled else {
+                  self.operationGeneration == generation, !Task.isCancelled
+            else {
                 throw CancellationError()
             }
             Task { @MainActor [weak self] in await self?.sweepExpiredAudio() }
@@ -727,10 +743,9 @@ final class MeetingSessionCoordinator: ObservableObject {
         _ snapshot: MeetingSession,
         configuration: MeetingCaptureConfiguration
     ) async throws -> MeetingSession {
-            let newSession = try await self.startRecording(
-                configuration: configuration, passiveOffer: snapshot, resolvingSourceID: snapshot.id
-            )
-            return newSession
+        return try await self.startRecording(
+            configuration: configuration, passiveOffer: snapshot, resolvingSourceID: snapshot.id
+        )
     }
 
     private func recordAgainFromHistory(
@@ -1064,7 +1079,9 @@ final class MeetingSessionCoordinator: ObservableObject {
     }
 
     /// Exposed for tests only: whether a future-deadline sweep is currently scheduled.
-    var hasScheduledRetentionSweep: Bool { self.retentionTimerTask != nil }
+    var hasScheduledRetentionSweep: Bool {
+        self.retentionTimerTask != nil
+    }
 
     private func scheduleRetentionTimer(nextDeadline: Date?) {
         self.retentionTimerTask?.cancel()
@@ -1418,6 +1435,16 @@ final class MeetingSessionCoordinator: ObservableObject {
             session.speakers = result.speakers
             session.transcriptSegments = result.segments
             session.transcriptCoverageGaps = result.coverageGaps.isEmpty ? nil : result.coverageGaps
+            // Canonical attempts carry a sidecar that was already written and read-back verified
+            // by the pipeline; legacy attempts leave this nil. The reference only becomes durable
+            // with the session save below, and the checkpoint survives until that save succeeds.
+            session.resultSidecarReference = result.resultSidecarReference
+            session.transcriptIsComplete = result.resultSidecarReference == nil
+                ? nil
+                : result.isComplete
+            if result.resultSidecarReference != nil {
+                session.transcriptTimeDomain = .meetingRelative
+            }
             session.processingAttempts.removeAll {
                 $0.completedAt == nil && $0.id != result.attempt.id
             }
@@ -1447,15 +1474,40 @@ final class MeetingSessionCoordinator: ObservableObject {
                 let excludedSeconds = result.coverageGaps.reduce(0.0) { total, gap in
                     total + max(0, gap.end - gap.start)
                 }
+                let allUnprotectedMicrophone = result.coverageGaps.allSatisfy {
+                    $0.reason == .unprotectedMicrophone
+                }
+                let allMicrophoneAdmission = result.coverageGaps.allSatisfy {
+                    $0.reason == .unprotectedMicrophone || $0.reason == .inadmissibleCaptureEra
+                }
                 session.events.append(MeetingSessionEvent(
                     id: UUID(),
                     occurredAt: Date(),
-                    kind: .microphoneChanged,
+                    kind: .transcriptCoverageIncomplete,
                     trackID: result.coverageGaps.first?.trackID,
-                    detail: String(
-                        format: "%.1f seconds of unprotected microphone audio were excluded from the transcript.",
-                        excludedSeconds
-                    )
+                    detail: allUnprotectedMicrophone
+                        ? String(
+                            format: "%.1f seconds of unprotected microphone audio were excluded from the transcript.",
+                            excludedSeconds
+                        )
+                        : allMicrophoneAdmission
+                        ? String(
+                            format: "%.1f seconds of microphone audio were excluded because capture admission was not verified.",
+                            excludedSeconds
+                        )
+                        : String(
+                            format: "%.1f seconds of meeting audio have no transcript coverage.",
+                            excludedSeconds
+                        )
+                ))
+            }
+            if !result.isComplete, result.coverageGaps.isEmpty {
+                session.events.append(MeetingSessionEvent(
+                    id: UUID(),
+                    occurredAt: Date(),
+                    kind: .transcriptCoverageIncomplete,
+                    trackID: nil,
+                    detail: "Some recognized text could not be safely placed on the meeting timeline."
                 ))
             }
             session.state = .completed
@@ -1479,6 +1531,12 @@ final class MeetingSessionCoordinator: ObservableObject {
                 throw error
             }
             if error is CancellationError {
+                session.speakers = inputSession.speakers
+                session.transcriptSegments = inputSession.transcriptSegments
+                session.transcriptCoverageGaps = inputSession.transcriptCoverageGaps
+                session.resultSidecarReference = inputSession.resultSidecarReference
+                session.transcriptIsComplete = inputSession.transcriptIsComplete
+                session.transcriptTimeDomain = inputSession.transcriptTimeDomain
                 session.state = .interrupted
                 session.updatedAt = Date()
                 await self.flushQueuedPersistence()
@@ -1490,6 +1548,15 @@ final class MeetingSessionCoordinator: ObservableObject {
                 throw error
             }
             let failure = Self.failure(from: error, domain: .processing, recoverable: true)
+            // A failed completed-session save must not durably publish a sidecar or overwrite the
+            // last saved transcript under `.failed`. The verified new sidecar remains unreferenced
+            // for retry/journal reconciliation.
+            session.speakers = inputSession.speakers
+            session.transcriptSegments = inputSession.transcriptSegments
+            session.transcriptCoverageGaps = inputSession.transcriptCoverageGaps
+            session.resultSidecarReference = inputSession.resultSidecarReference
+            session.transcriptIsComplete = inputSession.transcriptIsComplete
+            session.transcriptTimeDomain = inputSession.transcriptTimeDomain
             if let lastIndex = session.processingAttempts.indices.last {
                 session.processingAttempts[lastIndex].errorCode = failure.code
                 session.processingAttempts[lastIndex].completedAt = Date()

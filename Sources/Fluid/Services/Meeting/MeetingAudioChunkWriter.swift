@@ -29,19 +29,20 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
     }
 
     private struct ActiveChunk: @unchecked Sendable {
+        var id: MeetingAudioChunkID
         var sequence: Int
-        var partialURL: URL
-        var finalURL: URL
         var relativeFinalPath: String
-        var writer: AVAssetWriter
-        var input: AVAssetWriterInput
+        var sink: MeetingAudioChunkSink
         var start: CMTime
         var end: CMTime
         var discontinuities: [MeetingAudioDiscontinuity]
         /// Captured at `beginChunk` — `self.track.format` may already be the NEXT chunk's by finalize.
         var format: MeetingAudioFormat
         var sourceFormatDescription: CMFormatDescription
+        var formatContract: MeetingPCMFormatContract
         var producerEpoch: UInt64
+        var framesWritten: Int64
+        var lastCheckpointFrames: Int64
     }
 
     private enum FinalizationResult: @unchecked Sendable {
@@ -61,6 +62,7 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
     private let chunkDuration: TimeInterval
     private let eventHandler: EventHandler
     private let encoder: JSONEncoder
+    private let ledger: MeetingAudioChunkLedgerStore
 
     let trackID: MeetingAudioTrackID
 
@@ -100,7 +102,10 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
         sessionDirectory: URL,
         chunkDuration: TimeInterval,
         eventHandler: @escaping EventHandler,
-        pendingSlotLimit: Int = 24
+        // PCM persistence is intentionally synchronous on the serialized writer queue. Keep the
+        // queue bounded, but allow roughly 1.3 seconds of capture jitter at a 48 kHz/10 ms tap
+        // cadence while the filesystem drains a burst.
+        pendingSlotLimit: Int = 128
     ) throws {
         self.trackID = track.id
         self.track = track
@@ -111,12 +116,13 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
         self.manifestURL = self.trackDirectory.appendingPathComponent("track.json")
         self.chunkDuration = max(60, chunkDuration)
         self.eventHandler = eventHandler
+        self.ledger = MeetingAudioChunkLedgerStore(sessionDirectory: sessionDirectory)
         self.queue = DispatchQueue(
             label: "com.fluidvoice.meeting.writer.\(track.kind.rawValue)",
             qos: .userInitiated
         )
         self.finalizationQueue = DispatchQueue(
-            label: "com.fluidvoice.meeting.writer.\(track.kind.rawValue).finalization",
+            label: "com.fluidvoice.meeting.writer.\(track.kind.rawValue).pcm-finalization",
             qos: .utility
         )
         self.pendingSlots = DispatchSemaphore(value: max(0, pendingSlotLimit))
@@ -459,28 +465,30 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
                     discontinuities: boundaryDiscontinuity.map { [$0] } ?? []
                 )
             } else if let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
-                      !CMFormatDescriptionEqual(formatDescription, otherFormatDescription: self.activeChunk?.sourceFormatDescription)
+                      let incomingContract = try? MeetingPCMFormatContract(formatDescription: formatDescription),
+                      incomingContract != self.activeChunk?.formatContract
             {
                 self.scheduleActiveChunkFinalization()
                 try self.beginChunk(
                     with: sampleBuffer,
                     at: presentationTime,
                     producerEpoch: producerEpoch,
-                    discontinuities: []
+                    discontinuities: [],
+                    contract: incomingContract
                 )
             }
             guard var activeChunk = self.activeChunk else { return }
-            guard activeChunk.input.isReadyForMoreMediaData else {
-                self.recordDroppedSample(detail: "Audio encoder backpressure caused a dropped sample.")
-                return
-            }
-            guard activeChunk.input.append(sampleBuffer) else {
-                throw MeetingCaptureError.writerFailed(
-                    activeChunk.writer.error?.localizedDescription ?? "The audio encoder rejected a sample."
-                )
+            let receipt = try activeChunk.sink.append(sampleBuffer)
+            guard receipt.framesAccepted == receipt.framesWritten,
+                  receipt.framesAccepted == Int64(CMSampleBufferGetNumSamples(sampleBuffer)) else {
+                throw MeetingCaptureError.writerFailed("PCM sink reported a short write.")
             }
 
             activeChunk.end = presentationTime + duration
+            activeChunk.framesWritten += receipt.framesWritten
+            if activeChunk.framesWritten - activeChunk.lastCheckpointFrames >= Int64((activeChunk.format.sampleRate).rounded()) {
+                try self.writeCheckpoint(for: &activeChunk)
+            }
             self.activeChunk = activeChunk
             self.track.health.status = .healthy
             self.track.health.lastPresentationTime = Self.mediaTime(presentationTime)
@@ -502,13 +510,29 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
             self.track.health.detail = nil
             self.emitHealthIfNeeded()
         } catch {
-            self.track.health.status = .degraded
-            self.track.health.detail = error.localizedDescription
-            self.eventHandler(.interrupted(
-                kind: .writerFailure,
-                trackID: self.track.id,
-                detail: error.localizedDescription
-            ))
+            // A sink failure poisons the current container. Retire it immediately so the next
+            // callback can establish a fresh chunk instead of retrying the same invalid sink and
+            // emitting an error storm for every subsequent buffer.
+            var retiredChunk = false
+            if let failedChunk = self.activeChunk {
+                retiredChunk = true
+                self.activeChunk = nil
+                self.lastFinalizedEnd = failedChunk.end
+                failedChunk.sink.cancel()
+                self.applyFinalization(.failed(
+                    Self.failedChunk(from: failedChunk),
+                    "PCM chunk write failed: \(error.localizedDescription)"
+                ))
+            }
+            if !retiredChunk {
+                self.track.health.status = .degraded
+                self.track.health.detail = error.localizedDescription
+                self.eventHandler(.interrupted(
+                    kind: .writerFailure,
+                    trackID: self.track.id,
+                    detail: error.localizedDescription
+                ))
+            }
         }
     }
 
@@ -516,7 +540,8 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
         with sampleBuffer: CMSampleBuffer,
         at start: CMTime,
         producerEpoch: UInt64,
-        discontinuities: [MeetingAudioDiscontinuity]
+        discontinuities: [MeetingAudioDiscontinuity],
+        contract: MeetingPCMFormatContract? = nil
     ) throws {
         guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)?.pointee,
@@ -526,74 +551,78 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
             throw MeetingCaptureError.unsupportedAudioFormat
         }
 
-        let channelCount = min(2, max(1, Int(asbd.mChannelsPerFrame)))
-        let bitRate = channelCount == 1 ? 64_000 : 96_000
+        let formatContract = try contract ?? MeetingPCMFormatContract(formatDescription: formatDescription)
+
+        guard asbd.mFormatID == kAudioFormatLinearPCM,
+              asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0,
+              asbd.mBitsPerChannel == 32,
+              asbd.mFramesPerPacket == 1
+        else { throw MeetingCaptureError.unsupportedAudioFormat }
+
+        let channelCount = Int(asbd.mChannelsPerFrame)
         let sequence = self.nextChunkSequence
         self.nextChunkSequence += 1
         let stem = String(format: "%06d", sequence)
-        let partialURL = self.trackDirectory.appendingPathComponent("\(stem).partial.m4a")
-        let finalURL = self.trackDirectory.appendingPathComponent("\(stem).m4a")
-        try? FileManager.default.removeItem(at: partialURL)
-
-        let writer = try AVAssetWriter(outputURL: partialURL, fileType: .m4a)
-        let outputSettings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVSampleRateKey: asbd.mSampleRate,
-            AVNumberOfChannelsKey: channelCount,
-            AVEncoderBitRateKey: bitRate,
-        ]
-        let input = AVAssetWriterInput(
-            mediaType: .audio,
-            outputSettings: outputSettings,
-            sourceFormatHint: formatDescription
-        )
-        input.expectsMediaDataInRealTime = true
-        guard writer.canAdd(input) else { throw MeetingCaptureError.unsupportedAudioFormat }
-        writer.add(input)
-        guard writer.startWriting() else {
-            throw MeetingCaptureError.writerFailed(
-                writer.error?.localizedDescription ?? "The audio writer could not start."
-            )
-        }
-        // `consume` normalizes the sample itself before it reaches AVAssetWriter. Chunk metadata and
-        // encoded sample timing therefore live on one canonical timeline.
-        writer.startSession(atSourceTime: start)
-
         let format = MeetingAudioFormat(
-            codec: "aac-lc",
+            codec: "lpcm-f32",
             sampleRate: asbd.mSampleRate,
             channelCount: channelCount,
-            bitRate: bitRate
+            bitRate: nil
         )
+        let sink = MeetingAudioFilePCMChunkSink(sessionDirectory: self.sessionDirectory)
+        let relativePath = "tracks/\(self.track.kind.rawValue)/\(stem).caf"
+        let clientFormat = AVAudioFormat(cmAudioFormatDescription: formatDescription)
+        try sink.begin(relativeFilePath: relativePath, format: clientFormat, contract: formatContract)
+        let id = UUID()
+        do {
+            try self.ledger.writeIntent(MeetingAudioChunkLedgerIntent(
+                chunkID: id,
+                sequence: sequence,
+                canonicalStart: Self.mediaTime(start),
+                producerEpoch: producerEpoch,
+                sourceFormat: format,
+                partialRelativeFilePath: sink.partialRelativeFilePath ?? relativePath,
+                createdAt: Date()
+            ))
+        } catch {
+            sink.cancel()
+            throw error
+        }
         self.track.format = format
-        let relativePath = finalURL.path.replacingOccurrences(
-            of: self.sessionDirectory.path + "/",
-            with: ""
-        )
         self.activeChunk = ActiveChunk(
+            id: id,
             sequence: sequence,
-            partialURL: partialURL,
-            finalURL: finalURL,
             relativeFinalPath: relativePath,
-            writer: writer,
-            input: input,
+            sink: sink,
             start: start,
             end: start,
             discontinuities: discontinuities,
             format: format,
             sourceFormatDescription: formatDescription,
-            producerEpoch: producerEpoch
+            formatContract: formatContract,
+            producerEpoch: producerEpoch,
+            framesWritten: 0,
+            lastCheckpointFrames: 0
         )
     }
 
     private func scheduleActiveChunkFinalization() {
-        guard let activeChunk = self.activeChunk else { return }
+        guard var activeChunk = self.activeChunk else { return }
         self.activeChunk = nil
         self.lastFinalizedEnd = activeChunk.end
-        activeChunk.input.markAsFinished()
+        do {
+            try self.writeCheckpoint(for: &activeChunk)
+        } catch {
+            activeChunk.sink.cancel()
+            self.applyFinalization(.failed(
+                Self.failedChunk(from: activeChunk),
+                "PCM chunk checkpoint failed: \(error.localizedDescription)"
+            ))
+            return
+        }
 
         guard self.finalizationSlots.wait(timeout: .now()) == .success else {
-            activeChunk.writer.cancelWriting()
+            activeChunk.sink.cancel()
             self.applyFinalization(.failed(
                 Self.failedChunk(from: activeChunk),
                 "Audio chunk finalization was saturated; the chunk was closed without blocking capture."
@@ -602,6 +631,10 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
         }
 
         self.finalizationGroup.enter()
+        // The active chunk has been removed from the writer queue, so ownership of this sink can
+        // transfer to the finalization queue with no concurrent append/cancel calls. Reopen, hash
+        // and fsync are intentionally off the capture queue: a 60-second Float32 CAF is large
+        // enough to overflow the bounded producer queue if finalization blocks it.
         self.finalizationQueue.async { [self, activeChunk] in
             let result = Self.finalize(activeChunk)
             self.queue.async { [self] in
@@ -616,10 +649,37 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
         switch result {
         case let .finalized(chunk, format):
             self.track.chunks.append(chunk)
+            do {
+                try self.ledger.writeTerminal(MeetingAudioChunkLedgerTerminal(
+                    chunkID: chunk.id,
+                    status: .ready,
+                    updatedAt: Date(),
+                    detail: nil
+                ), for: chunk.id)
+            } catch {
+                // A PCM file that finalized without a durable ready terminal is not publishable.
+                // Keep the chunk fail-closed and surface the ledger failure to the capture owner.
+                try? FileManager.default.removeItem(at: self.sessionDirectory.appendingPathComponent(chunk.relativeFilePath))
+                if let index = self.track.chunks.firstIndex(where: { $0.id == chunk.id }) {
+                    self.track.chunks[index].finalizationState = .failed
+                    self.track.chunks[index].captureAnalysisAsset?.presence = .failed
+                }
+                self.track.health.status = .degraded
+                self.track.health.detail = "PCM chunk ledger terminal failed: \(error.localizedDescription)"
+                self.eventHandler(.interrupted(kind: .writerFailure, trackID: self.track.id, detail: self.track.health.detail ?? "PCM chunk ledger terminal failed."))
+                try? self.persistTrackManifest()
+                return
+            }
             try? self.persistTrackManifest()
             self.eventHandler(.chunkFinalized(trackID: self.track.id, chunk: chunk, format: format))
         case let .failed(chunk, detail):
             self.track.chunks.append(chunk)
+            try? self.ledger.writeTerminal(MeetingAudioChunkLedgerTerminal(
+                chunkID: chunk.id,
+                status: .failed,
+                updatedAt: Date(),
+                detail: detail
+            ), for: chunk.id)
             self.track.health.status = .degraded
             self.track.health.detail = detail
             try? self.persistTrackManifest()
@@ -653,52 +713,41 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
                 "Audio chunk timing was not monotonic."
             )
         }
-        let completion = DispatchSemaphore(value: 0)
-        activeChunk.writer.finishWriting { completion.signal() }
-        guard completion.wait(timeout: .now() + 4) == .success else {
-            activeChunk.writer.cancelWriting()
-            return .failed(
-                self.failedChunk(from: activeChunk),
-                "Timed out while finalizing the audio chunk."
+        switch activeChunk.sink.finalize() {
+        case let .success(finalization):
+            let asset = MeetingAudioAsset(
+                role: .captureAnalysis,
+                encoding: .linearPCMFloat32CAFV1,
+                presence: .ready,
+                relativeFilePath: finalization.relativeFilePath,
+                byteCount: finalization.byteCount,
+                sha256: finalization.sha256,
+                sampleRate: finalization.sampleRate,
+                channelCount: finalization.channelCount,
+                frameCount: finalization.frameCount
             )
-        }
-        guard activeChunk.writer.status == .completed else {
-            return .failed(
-                self.failedChunk(from: activeChunk),
-                activeChunk.writer.error?.localizedDescription ?? "The audio chunk could not be finalized."
-            )
-        }
-
-        do {
-            try? FileManager.default.removeItem(at: activeChunk.finalURL)
-            try FileManager.default.moveItem(at: activeChunk.partialURL, to: activeChunk.finalURL)
-            try FileManager.default.setAttributes(
-                [.posixPermissions: NSNumber(value: Int16(0o600))],
-                ofItemAtPath: activeChunk.finalURL.path
-            )
-            let values = try activeChunk.finalURL.resourceValues(forKeys: [.fileSizeKey])
-            return try .finalized(
-                MeetingAudioChunk(
-                    id: UUID(),
-                    sequence: activeChunk.sequence,
-                    relativeFilePath: activeChunk.relativeFinalPath,
-                    presentationStart: self.mediaTime(activeChunk.start),
-                    presentationEnd: self.mediaTime(activeChunk.end),
-                    discontinuities: activeChunk.discontinuities,
-                    sha256: self.sha256(of: activeChunk.finalURL),
-                    byteCount: Int64(values.fileSize ?? 0),
-                    finalizationState: .finalized
-                ),
-                activeChunk.format
-            )
-        } catch {
-            return .failed(self.failedChunk(from: activeChunk), error.localizedDescription)
+            return .finalized(MeetingAudioChunk(
+                id: activeChunk.id,
+                sequence: activeChunk.sequence,
+                relativeFilePath: finalization.relativeFilePath,
+                presentationStart: self.mediaTime(activeChunk.start),
+                presentationEnd: self.mediaTime(activeChunk.end),
+                discontinuities: activeChunk.discontinuities,
+                sha256: finalization.sha256,
+                byteCount: finalization.byteCount,
+                finalizationState: .finalized,
+                audioSchemaVersion: 2,
+                captureAnalysisAsset: asset,
+                playbackArchiveAsset: nil
+            ), activeChunk.format)
+        case let .failure(error):
+            return .failed(self.failedChunk(from: activeChunk), "PCM chunk finalization failed: \(error)")
         }
     }
 
     private nonisolated static func failedChunk(from activeChunk: ActiveChunk) -> MeetingAudioChunk {
         MeetingAudioChunk(
-            id: UUID(),
+            id: activeChunk.id,
             sequence: activeChunk.sequence,
             relativeFilePath: activeChunk.relativeFinalPath,
             presentationStart: self.mediaTime(activeChunk.start),
@@ -706,8 +755,29 @@ final nonisolated class MeetingAudioChunkWriter: @unchecked Sendable {
             discontinuities: activeChunk.discontinuities,
             sha256: "",
             byteCount: 0,
-            finalizationState: .failed
+            finalizationState: .failed,
+            audioSchemaVersion: 2,
+            captureAnalysisAsset: MeetingAudioAsset(
+                role: .captureAnalysis,
+                encoding: .linearPCMFloat32CAFV1,
+                presence: .failed,
+                relativeFilePath: activeChunk.relativeFinalPath,
+                byteCount: 0
+            ),
+            playbackArchiveAsset: nil
         )
+    }
+
+    private func writeCheckpoint(for activeChunk: inout ActiveChunk) throws {
+        guard activeChunk.framesWritten > 0 else { return }
+        try self.ledger.writeCheckpoint(MeetingAudioChunkLedgerCheckpoint(
+            chunkID: activeChunk.id,
+            expectedFrames: activeChunk.framesWritten,
+            writtenFrames: activeChunk.framesWritten,
+            lastCanonicalPTS: Self.mediaTime(activeChunk.end),
+            updatedAt: Date()
+        ), for: activeChunk.id)
+        activeChunk.lastCheckpointFrames = activeChunk.framesWritten
     }
 
     private func recordDroppedSample(detail: String) {

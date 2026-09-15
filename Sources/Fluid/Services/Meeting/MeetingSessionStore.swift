@@ -1,3 +1,5 @@
+import CryptoKit
+import Darwin
 import Foundation
 
 nonisolated protocol MeetingSessionStoring: Sendable {
@@ -101,10 +103,11 @@ actor MeetingSessionStore: MeetingSessionStoring {
         guard self.fileSystem.manager.fileExists(atPath: url.path) else { return nil }
         let session = try self.decodeSession(at: url)
         let reconciled = try self.reconcileTrackManifests(in: session)
-        if reconciled != session {
-            try self.writeSession(reconciled)
+        let migrated = self.migrateCanonicalTranscriptTimelineIfNeeded(reconciled)
+        if migrated != session {
+            try self.writeSession(migrated)
         }
-        return reconciled
+        return migrated
     }
 
     func loadAll() throws -> [MeetingSession] {
@@ -201,6 +204,123 @@ actor MeetingSessionStore: MeetingSessionStoring {
         return session
     }
 
+    /// Canonical sessions published before the explicit timeline-domain marker stored product
+    /// segment/gap times in absolute host presentation seconds. The immutable sidecar remains in
+    /// analysis time and carries the verified presentation origin, so migrate only `session.json`
+    /// once and never rewrite the sidecar it references.
+    private func migrateCanonicalTranscriptTimelineIfNeeded(
+        _ inputSession: MeetingSession
+    ) -> MeetingSession {
+        guard inputSession.transcriptTimeDomain == nil,
+              let reference = inputSession.resultSidecarReference,
+              let attempt = inputSession.processingAttempts.last(where: {
+                  $0.backendID != nil
+                      && MeetingResultSidecarStore.fileName(for: $0.id) == reference.fileName
+              }),
+              let backendID = attempt.backendID.map({ MeetingBackendID(rawValue: $0) })
+        else { return inputSession }
+
+        let directory = self.sessionDirectoryURL(for: inputSession.id)
+        let verifiedOrigin: TimeInterval?
+        do {
+            let sidecar = try MeetingResultSidecarStore(sessionDirectory: directory).read(
+                expectedAttemptID: attempt.id,
+                expectedBackendID: backendID,
+                reference: reference
+            )
+            verifiedOrigin = sidecar.analysisManifest.presentationOriginSeconds
+        } catch {
+            verifiedOrigin = nil
+            DebugLogger.shared.warning(
+                "Could not verify canonical transcript sidecar while migrating timeline for "
+                    + "\(inputSession.id): \(error.localizedDescription)",
+                source: "MeetingSessionStore"
+            )
+        }
+
+        let origin = verifiedOrigin ?? inputSession.timebase.firstPresentationTime?.seconds
+        guard let origin,
+              let migrated = Self.migratingCanonicalTimelineToMeetingRelative(
+                  inputSession,
+                  presentationOriginSeconds: origin
+              )
+        else {
+            DebugLogger.shared.warning(
+                "Canonical transcript timeline for \(inputSession.id) could not be migrated safely.",
+                source: "MeetingSessionStore"
+            )
+            return inputSession
+        }
+        DebugLogger.shared.info(
+            "Migrated canonical transcript timeline to meeting-relative seconds for \(inputSession.id).",
+            source: "MeetingSessionStore"
+        )
+        return migrated
+    }
+
+    /// Pure migration seam used by load-time recovery and tests. A negative result beyond the
+    /// rounding tolerance means the supplied origin does not describe this transcript, so refuse
+    /// the whole migration instead of partially shifting or guessing.
+    nonisolated static func migratingCanonicalTimelineToMeetingRelative(
+        _ inputSession: MeetingSession,
+        presentationOriginSeconds origin: TimeInterval
+    ) -> MeetingSession? {
+        guard inputSession.transcriptTimeDomain == nil, origin.isFinite, origin >= 0 else {
+            return nil
+        }
+        let tolerance = MeetingAnalysisManifestSchema.mappingToleranceSeconds
+        var migrated = inputSession
+
+        for index in migrated.transcriptSegments.indices {
+            let start = migrated.transcriptSegments[index].start.seconds - origin
+            let end = migrated.transcriptSegments[index].end.seconds - origin
+            guard start.isFinite, end.isFinite,
+                  start >= -tolerance,
+                  end + tolerance >= start,
+                  let shiftedStart = Self.mediaTime(
+                      seconds: max(0, start),
+                      timescale: migrated.transcriptSegments[index].start.timescale
+                  ),
+                  let shiftedEnd = Self.mediaTime(
+                      seconds: max(max(0, start), end),
+                      timescale: migrated.transcriptSegments[index].end.timescale
+                  )
+            else { return nil }
+            migrated.transcriptSegments[index].start = shiftedStart
+            migrated.transcriptSegments[index].end = shiftedEnd
+        }
+
+        if var gaps = migrated.transcriptCoverageGaps {
+            for index in gaps.indices {
+                let start = gaps[index].start - origin
+                let end = gaps[index].end - origin
+                guard start.isFinite, end.isFinite,
+                      start >= -tolerance,
+                      end + tolerance >= start
+                else { return nil }
+                gaps[index].start = max(0, start)
+                gaps[index].end = max(gaps[index].start, end)
+            }
+            migrated.transcriptCoverageGaps = gaps
+        }
+
+        migrated.transcriptTimeDomain = .meetingRelative
+        return migrated
+    }
+
+    private nonisolated static func mediaTime(
+        seconds: TimeInterval,
+        timescale: Int32
+    ) -> MeetingMediaTime? {
+        guard seconds.isFinite, seconds >= 0, timescale > 0 else { return nil }
+        let scaled = seconds * Double(timescale)
+        guard scaled.isFinite,
+              scaled >= Double(Int64.min),
+              scaled <= Double(Int64.max)
+        else { return nil }
+        return MeetingMediaTime(value: Int64(scaled.rounded()), timescale: timescale)
+    }
+
     private func reconcileTrackManifests(in inputSession: MeetingSession) throws -> MeetingSession {
         var session = inputSession
 
@@ -275,6 +395,12 @@ actor MeetingSessionStore: MeetingSessionStoring {
         _ inputChunk: MeetingAudioChunk,
         sessionDirectory: URL
     ) -> MeetingAudioChunk {
+        // New asset metadata is an explicit one-way boundary. Never apply the legacy
+        // size-repair rule to it: a staged/foreign file must not become trusted merely because it
+        // exists. Sessions with no new metadata retain the exact historical AAC behavior below.
+        if inputChunk.audioSchemaVersion != nil || inputChunk.captureAnalysisAsset != nil || inputChunk.playbackArchiveAsset != nil {
+            return self.reconcileNewAssetChunk(inputChunk, sessionDirectory: sessionDirectory)
+        }
         guard inputChunk.finalizationState == .finalized else { return inputChunk }
         let fileURL = inputChunk.fileURL(relativeTo: sessionDirectory).standardizedFileURL
         let rootPath = sessionDirectory.standardizedFileURL.path + "/"
@@ -293,6 +419,90 @@ actor MeetingSessionStore: MeetingSessionStoring {
         var reconciled = inputChunk
         reconciled.byteCount = Int64(fileSize)
         return reconciled
+    }
+
+    private func reconcileNewAssetChunk(
+        _ inputChunk: MeetingAudioChunk,
+        sessionDirectory: URL
+    ) -> MeetingAudioChunk {
+        var failed = inputChunk
+        func failCapture(_ chunk: inout MeetingAudioChunk) {
+            chunk.sha256 = ""
+            chunk.byteCount = 0
+            chunk.finalizationState = .failed
+            if var asset = chunk.captureAnalysisAsset, asset.presence == .ready { asset.presence = .failed; chunk.captureAnalysisAsset = asset }
+        }
+        guard let capture = inputChunk.captureAnalysisAsset,
+              capture.role == .captureAnalysis,
+              capture.presence == .ready,
+              capture.validationIssues().isEmpty,
+              self.assetMatchesDisk(capture, sessionDirectory: sessionDirectory)
+        else {
+            failCapture(&failed)
+            return failed
+        }
+        var reconciled = inputChunk
+        if var archive = reconciled.playbackArchiveAsset,
+           archive.presence == .ready,
+           (!archive.validationIssues().isEmpty || !self.assetMatchesDisk(archive, sessionDirectory: sessionDirectory))
+        {
+            // The archive is derived and optional. Quarantine only it; authoritative PCM remains
+            // finalized and retryable for a later archive job.
+            archive.presence = .failed
+            reconciled.playbackArchiveAsset = archive
+        }
+        reconciled.byteCount = capture.byteCount
+        reconciled.sha256 = capture.sha256 ?? ""
+        reconciled.finalizationState = .finalized
+        return reconciled
+    }
+
+    private func assetMatchesDisk(_ asset: MeetingAudioAsset, sessionDirectory: URL) -> Bool {
+        guard let url = self.confinedRegularAssetURL(
+            relativePath: asset.relativeFilePath,
+            sessionDirectory: sessionDirectory
+        ), let attributes = try? self.fileSystem.manager.attributesOfItem(atPath: url.path),
+           let size = (attributes[.size] as? NSNumber)?.int64Value,
+           size == asset.byteCount,
+           size > 0,
+           let expectedHash = asset.sha256,
+           let hash = self.sha256(of: url),
+           hash == expectedHash
+        else { return false }
+        return true
+    }
+
+    /// Lexical confinement plus an lstat walk. A descriptor-relative walk is intentionally outside
+    /// this additive foundation; concurrent path replacement remains a documented TOCTOU limit.
+    private func confinedRegularAssetURL(relativePath: String, sessionDirectory: URL) -> URL? {
+        let parts = relativePath.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard !relativePath.isEmpty, !relativePath.hasPrefix("/"), !parts.isEmpty,
+              parts.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else { return nil }
+        var current = sessionDirectory.standardizedFileURL
+        var rootStat = stat()
+        guard lstat(current.path, &rootStat) == 0, (rootStat.st_mode & S_IFMT) != S_IFLNK else { return nil }
+        for part in parts {
+            current.appendPathComponent(part, isDirectory: false)
+            var info = stat()
+            guard lstat(current.path, &info) == 0, (info.st_mode & S_IFMT) != S_IFLNK else { return nil }
+        }
+        var final = stat()
+        guard lstat(current.path, &final) == 0, (final.st_mode & S_IFMT) == S_IFREG else { return nil }
+        return current
+    }
+
+    private func sha256(of url: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        var digest = SHA256()
+        while true {
+            let data: Data
+            do { data = try handle.read(upToCount: 1 << 20) ?? Data() }
+            catch { return nil }
+            guard !data.isEmpty else { break }
+            digest.update(data: data)
+        }
+        return digest.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     private func prepareRootDirectory() throws {

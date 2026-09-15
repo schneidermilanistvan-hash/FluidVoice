@@ -196,6 +196,22 @@ private final class DeallocationProvider: TranscriptionProvider, @unchecked Send
     }
 }
 
+/// Bounded observation that never owns or cancels the operation being observed. Tests open
+/// their gates and join their task handles after observation, so non-cooperative hooks cannot
+/// strand a throwing timeout task-group child.
+@MainActor
+private func waitUntilCondition(
+    timeoutNanoseconds: UInt64 = 5_000_000_000,
+    condition: @escaping @MainActor () -> Bool
+) async -> Bool {
+    let deadline = DispatchTime.now().uptimeNanoseconds + timeoutNanoseconds
+    while !condition() {
+        if DispatchTime.now().uptimeNanoseconds >= deadline { return false }
+        try? await Task.sleep(nanoseconds: 1_000_000)
+    }
+    return true
+}
+
 @MainActor
 final class MeetingASRPreparationOwnerTests: XCTestCase {
     @MainActor private final class Harness {
@@ -282,21 +298,6 @@ final class MeetingASRPreparationOwnerTests: XCTestCase {
         }
 #endif
         return secondWaiterEntered
-    }
-
-    /// Bounded observation that never owns or cancels the operation being observed. Tests open
-    /// their gates and join their task handles after observation, so non-cooperative hooks cannot
-    /// strand a throwing timeout task-group child.
-    private func waitUntil(
-        timeoutNanoseconds: UInt64 = 5_000_000_000,
-        condition: @escaping @MainActor () -> Bool
-    ) async -> Bool {
-        let deadline = DispatchTime.now().uptimeNanoseconds + timeoutNanoseconds
-        while !condition() {
-            if DispatchTime.now().uptimeNanoseconds >= deadline { return false }
-            try? await Task.sleep(nanoseconds: 1_000_000)
-        }
-        return true
     }
 
     func testRejectsInvalidLeaseBeforeAnyMutationOrDependencyCall() async {
@@ -459,7 +460,7 @@ final class MeetingASRPreparationOwnerTests: XCTestCase {
             )
             return ObjectIdentifier(provider as AnyObject)
         }
-        let enteredObserved = await self.waitUntil { entered.opened }
+        let enteredObserved = await waitUntilCondition { entered.opened }
         XCTAssertTrue(enteredObserved)
 
         let second = Task { @MainActor in
@@ -497,7 +498,7 @@ final class MeetingASRPreparationOwnerTests: XCTestCase {
                 lease: lease, attemptID: attempt, configuration: configuration
             )
         }
-        let enteredObserved = await self.waitUntil { entered.opened }
+        let enteredObserved = await waitUntilCondition { entered.opened }
         XCTAssertTrue(enteredObserved)
 
         let otherLease = self.makeLease()
@@ -559,7 +560,7 @@ final class MeetingASRPreparationOwnerTests: XCTestCase {
                 lease: lease, attemptID: attemptID, configuration: MeetingFinalProcessingConfiguration()
             )
         }
-        let enteredObserved = await self.waitUntil { entered.opened }
+        let enteredObserved = await waitUntilCondition { entered.opened }
         XCTAssertTrue(enteredObserved)
 
         preparation.cancel()
@@ -627,7 +628,7 @@ final class MeetingASRPreparationOwnerTests: XCTestCase {
                     lease: lease, attemptID: UUID(), configuration: MeetingFinalProcessingConfiguration()
                 )
             }
-            let observed = await self.waitUntil { harness.retireEntered.opened }
+            let observed = await waitUntilCondition { harness.retireEntered.opened }
             XCTAssertTrue(observed)
             preparation.cancel()
             XCTAssertTrue(harness.owner.isClaimed)
@@ -652,7 +653,7 @@ final class MeetingASRPreparationOwnerTests: XCTestCase {
                     lease: lease, attemptID: UUID(), configuration: MeetingFinalProcessingConfiguration()
                 )
             }
-            let observed = await self.waitUntil { harness.retireEntered.opened }
+            let observed = await waitUntilCondition { harness.retireEntered.opened }
             XCTAssertTrue(observed)
             harness.registry.deactivateAll()
             harness.retireGate.open()
@@ -697,13 +698,13 @@ final class MeetingASRPreparationOwnerTests: XCTestCase {
                 lease: lease, attemptID: UUID(), configuration: MeetingFinalProcessingConfiguration()
             )
         }
-        let enteredObserved = await self.waitUntil { entered.opened }
+        let enteredObserved = await waitUntilCondition { entered.opened }
         XCTAssertTrue(enteredObserved)
         let token = try XCTUnwrap(harness.owner.currentClaimToken)
         harness.drainGate.reset()
         let release = Task { @MainActor in await harness.owner.release(token) }
         providerGate.open()
-        let drainObserved = await self.waitUntil { harness.recorder.count(of: "drain") == 1 }
+        let drainObserved = await waitUntilCondition { harness.recorder.count(of: "drain") == 1 }
         XCTAssertTrue(drainObserved)
         XCTAssertEqual(harness.recorder.count(of: "drain"), 1)
         harness.drainGate.open()
@@ -756,7 +757,7 @@ final class MeetingASRPreparationOwnerTests: XCTestCase {
                 lease: lease, attemptID: attemptID, configuration: MeetingFinalProcessingConfiguration()
             )
         }
-        let enteredObserved = await self.waitUntil { entered.opened }
+        let enteredObserved = await waitUntilCondition { entered.opened }
         XCTAssertTrue(enteredObserved)
         let second = Task { @MainActor in
 #if !DEBUG
@@ -768,9 +769,9 @@ final class MeetingASRPreparationOwnerTests: XCTestCase {
         }
         // Both waiters join the same exact operation; cancellation of one cancels the shared worker.
 #if DEBUG
-        let secondObserved = await self.waitUntil { secondWaiterEntered.opened }
+        let secondObserved = await waitUntilCondition { secondWaiterEntered.opened }
 #else
-        let secondObserved = await self.waitUntil { secondStarted.opened }
+        let secondObserved = await waitUntilCondition { secondStarted.opened }
 #endif
         XCTAssertTrue(secondObserved)
         second.cancel()
@@ -817,7 +818,7 @@ final class MeetingASRPreparationOwnerTests: XCTestCase {
                 lease: lease, attemptID: attemptID, configuration: MeetingFinalProcessingConfiguration()
             )
         }
-        let enteredObserved = await self.waitUntil { entered.opened }
+        let enteredObserved = await waitUntilCondition { entered.opened }
         XCTAssertTrue(enteredObserved)
         let second = Task { @MainActor in
 #if !DEBUG
@@ -829,9 +830,9 @@ final class MeetingASRPreparationOwnerTests: XCTestCase {
         }
         joinedWaiter = second
 #if DEBUG
-        let secondObserved = await self.waitUntil { secondWaiterEntered.opened }
+        let secondObserved = await waitUntilCondition { secondWaiterEntered.opened }
 #else
-        let secondObserved = await self.waitUntil { secondStarted.opened }
+        let secondObserved = await waitUntilCondition { secondStarted.opened }
 #endif
         XCTAssertTrue(secondObserved)
         providerGate.open()
@@ -889,7 +890,7 @@ final class MeetingASRPreparationOwnerTests: XCTestCase {
                 progress: progress
             )
         }
-        let enteredObserved = await self.waitUntil { entered.opened }
+        let enteredObserved = await waitUntilCondition { entered.opened }
         XCTAssertTrue(enteredObserved)
 
         let handler = try XCTUnwrap(harness.provider.lastProgressHandler)
@@ -917,7 +918,7 @@ final class MeetingASRPreparationOwnerTests: XCTestCase {
         let drainEntered = ContinuationGate()
         harness.drainHook.set { drainEntered.open() }
         let release = Task { @MainActor in await harness.owner.release(token) }
-        let drainObserved = await self.waitUntil { drainEntered.opened }
+        let drainObserved = await waitUntilCondition { drainEntered.opened }
         XCTAssertTrue(drainObserved)
         let staleDuringDrain = self.expectation(description: "no delivery while draining")
         staleDuringDrain.isInverted = true
@@ -965,7 +966,7 @@ final class MeetingASRPreparationOwnerTests: XCTestCase {
                     progress: { _ in deliveries.record("cancelled") }
                 )
             }
-            let enteredObserved = await self.waitUntil { entered.opened }
+            let enteredObserved = await waitUntilCondition { entered.opened }
             XCTAssertTrue(enteredObserved)
             let handler = try XCTUnwrap(harness.provider.lastProgressHandler)
             preparation.cancel()
@@ -999,7 +1000,7 @@ final class MeetingASRPreparationOwnerTests: XCTestCase {
                     progress: { _ in deliveries.record("invalid") }
                 )
             }
-            let enteredObserved = await self.waitUntil { entered.opened }
+            let enteredObserved = await waitUntilCondition { entered.opened }
             XCTAssertTrue(enteredObserved)
             let handler = try XCTUnwrap(harness.provider.lastProgressHandler)
             harness.registry.deactivateAll()
@@ -1034,7 +1035,7 @@ final class MeetingASRPreparationOwnerTests: XCTestCase {
         let firstRelease = Task { @MainActor in
             await harness.owner.release(token)
         }
-        let drainObserved = await self.waitUntil { drainEntered.opened }
+        let drainObserved = await waitUntilCondition { drainEntered.opened }
         XCTAssertTrue(drainObserved)
         XCTAssertTrue(harness.owner.isClaimed)
         XCTAssertTrue(harness.owner.isDraining)
@@ -1141,7 +1142,7 @@ final class MeetingASRPreparationOwnerTests: XCTestCase {
                 return false
             }
         }
-        let enteredObserved = await self.waitUntil { providerEntered.opened }
+        let enteredObserved = await waitUntilCondition { providerEntered.opened }
         XCTAssertTrue(enteredObserved)
         let second = Task { @MainActor in
 #if !DEBUG
@@ -1157,9 +1158,9 @@ final class MeetingASRPreparationOwnerTests: XCTestCase {
             }
         }
 #if DEBUG
-        let secondObserved = await self.waitUntil { secondWaiterEntered.opened }
+        let secondObserved = await waitUntilCondition { secondWaiterEntered.opened }
 #else
-        let secondObserved = await self.waitUntil { secondStarted.opened }
+        let secondObserved = await waitUntilCondition { secondStarted.opened }
 #endif
         XCTAssertTrue(secondObserved)
         providerGate.open()
@@ -1172,3 +1173,502 @@ final class MeetingASRPreparationOwnerTests: XCTestCase {
         XCTAssertTrue(probe.value)
     }
 }
+
+#if DEBUG
+private enum ScopeBodyTestError: Error {
+    case bodyFailed
+}
+
+/// Exercises `ASRService.withPreparedMeetingASR` with the real scope code and the real owner
+/// driven by fake dependency closures (injected through the DEBUG owner seam), plus the real
+/// production retirement path. No test loads or downloads real ASR models. The seam exists
+/// only in DEBUG builds, so the whole suite compiles out of release-config baseline builds.
+@MainActor
+final class ASRServiceMeetingASRScopeTests: XCTestCase {
+    @MainActor private final class Harness {
+        let service = ASRService()
+        let recorder = OrchestrationRecorder()
+        let registry = LeaseRegistry()
+        let provider = FakeMeetingTranscriptionProvider()
+        let userDownloadInProgress = TestFlag()
+        let retireGate = ContinuationGate(open: true)
+        let retireEntered = ContinuationGate()
+        let drainGate = ContinuationGate(open: true)
+        let drainHook = DrainHook()
+        let owner: MeetingASRPreparationOwner
+
+        init() {
+            let recorder = self.recorder
+            let registry = self.registry
+            let provider = self.provider
+            let userDownloadInProgress = self.userDownloadInProgress
+            let retireGate = self.retireGate
+            let retireEntered = self.retireEntered
+            let drainGate = self.drainGate
+            let drainHook = self.drainHook
+            self.owner = MeetingASRPreparationOwner(
+                isActiveLease: { lease in registry.isActive(lease) },
+                isUserDownloadInProgress: { userDownloadInProgress.value },
+                retireDictationResources: { _ in
+                    recorder.record("retire")
+                    retireEntered.open()
+                    await retireGate.wait()
+                },
+                makeProvider: { configuration in
+                    // The fingerprint proves the scope passes the configuration through untouched.
+                    recorder.record("factory:\(configuration.identityFingerprint)")
+                    return provider
+                },
+                prepareProvider: { preparedProvider, _, progressHandler in
+                    let identity = preparedProvider as AnyObject === provider
+                    recorder.record(identity ? "prepare" : "prepare:wrongProvider")
+                    try await provider.prepare(progressHandler: progressHandler)
+                },
+                drainExecutor: { _ in
+                    recorder.record("drain")
+                    drainHook.fire()
+                    await drainGate.wait()
+                }
+            )
+            self.service.meetingASRPreparationOwnerForTesting = self.owner
+        }
+
+        func openAllGates() {
+            self.retireGate.open()
+            self.provider.openPrepareGate()
+            self.drainGate.open()
+        }
+
+        func acquireMeetingLease() throws -> ASRActivityLease {
+            let lease = try self.service.acquireExclusiveActivity(.meeting)
+            self.registry.activate(lease)
+            return lease
+        }
+    }
+
+    private func makeHarness() -> Harness {
+        let harness = Harness()
+        self.addTeardownBlock { @MainActor in
+            harness.openAllGates()
+            if let token = harness.owner.currentClaimToken {
+                await harness.owner.release(token)
+            }
+        }
+        return harness
+    }
+
+    func testScopeRejectsWithoutActiveMeetingLease() async throws {
+        let harness = self.makeHarness()
+
+        do {
+            _ = try await harness.service.withPreparedMeetingASR(
+                attemptID: UUID(), configuration: MeetingFinalProcessingConfiguration()
+            ) { _ in "ran" }
+            XCTFail("Expected invalid lease rejection without an active lease")
+        } catch let error as MeetingASRPreparationError {
+            XCTAssertEqual(error, .invalidActivityLease)
+        } catch {
+            XCTFail("Expected MeetingASRPreparationError, got \(error)")
+        }
+
+        let dictationLease = try harness.service.acquireExclusiveActivity(.dictation)
+        do {
+            _ = try await harness.service.withPreparedMeetingASR(
+                attemptID: UUID(), configuration: MeetingFinalProcessingConfiguration()
+            ) { _ in "ran" }
+            XCTFail("Expected invalid lease rejection for a dictation lease")
+        } catch let error as MeetingASRPreparationError {
+            XCTAssertEqual(error, .invalidActivityLease)
+        } catch {
+            XCTFail("Expected MeetingASRPreparationError, got \(error)")
+        }
+        harness.service.releaseExclusiveActivity(dictationLease)
+
+        XCTAssertTrue(harness.recorder.events.isEmpty)
+        XCTAssertFalse(harness.owner.isClaimed)
+        XCTAssertEqual(harness.provider.prepareCalls, 0)
+    }
+
+    func testScopeSuccessPassesConfigurationThroughAndDrainsInOrder() async throws {
+        let harness = self.makeHarness()
+        let lease = try harness.acquireMeetingLease()
+        let configuration = MeetingFinalProcessingConfiguration(diarizationFingerprint: "scope-test")
+
+        let result = try await harness.service.withPreparedMeetingASR(
+            attemptID: UUID(), configuration: configuration
+        ) { provider in
+            XCTAssertTrue(provider as AnyObject === harness.provider as AnyObject)
+            return 42
+        }
+
+        XCTAssertEqual(result, 42)
+        XCTAssertEqual(
+            harness.recorder.events,
+            ["retire", "factory:\(configuration.identityFingerprint)", "prepare", "drain"]
+        )
+        XCTAssertFalse(harness.owner.isClaimed)
+        XCTAssertFalse(harness.owner.isDraining)
+
+        // The scope never releases the caller's lease.
+        XCTAssertThrowsError(try harness.service.acquireExclusiveActivity(.dictation)) { error in
+            guard let activityError = error as? ASRActivityError,
+                  case .activityInProgress(.meeting) = activityError
+            else {
+                return XCTFail("Expected meeting activity to still own the lease, got \(error)")
+            }
+        }
+        harness.service.releaseExclusiveActivity(lease)
+        let dictationLease = try harness.service.acquireExclusiveActivity(.dictation)
+        harness.service.releaseExclusiveActivity(dictationLease)
+    }
+
+    func testScopeBodyErrorDrainsAndRethrowsAndClearsScope() async throws {
+        let harness = self.makeHarness()
+        _ = try harness.acquireMeetingLease()
+
+        do {
+            _ = try await harness.service.withPreparedMeetingASR(
+                attemptID: UUID(), configuration: MeetingFinalProcessingConfiguration()
+            ) { _ -> Int in
+                throw ScopeBodyTestError.bodyFailed
+            }
+            XCTFail("Expected the body error to propagate")
+        } catch ScopeBodyTestError.bodyFailed {
+        } catch {
+            XCTFail("Expected ScopeBodyTestError, got \(error)")
+        }
+
+        XCTAssertEqual(harness.recorder.events.last, "drain")
+        XCTAssertFalse(harness.owner.isClaimed)
+
+        // The scope cleared: a fresh scope prepares and runs again.
+        let second = try await harness.service.withPreparedMeetingASR(
+            attemptID: UUID(), configuration: MeetingFinalProcessingConfiguration()
+        ) { _ in "second" }
+        XCTAssertEqual(second, "second")
+        XCTAssertEqual(harness.provider.prepareCalls, 2)
+        XCTAssertEqual(harness.recorder.count(of: "drain"), 2)
+        XCTAssertFalse(harness.owner.isClaimed)
+    }
+
+    func testScopeRejectsConcurrentCallerWhileBodyRuns() async throws {
+        let harness = self.makeHarness()
+        _ = try harness.acquireMeetingLease()
+        let attemptID = UUID()
+        let configuration = MeetingFinalProcessingConfiguration()
+        let bodyEntered = ContinuationGate()
+        let finishBody = ContinuationGate()
+
+        let first = Task { @MainActor in
+            try await harness.service.withPreparedMeetingASR(
+                attemptID: attemptID, configuration: configuration
+            ) { _ in
+                bodyEntered.open()
+                await finishBody.wait()
+                return "first"
+            }
+        }
+        let enteredObserved = await waitUntilCondition { bodyEntered.opened }
+        XCTAssertTrue(enteredObserved)
+
+        // Same attempt and configuration: the scope guard rejects before the owner could join.
+        do {
+            _ = try await harness.service.withPreparedMeetingASR(
+                attemptID: attemptID, configuration: configuration
+            ) { _ in "second" }
+            XCTFail("Expected concurrent scope rejection")
+        } catch let error as MeetingASRPreparationError {
+            XCTAssertEqual(error, .preparationInProgress)
+        } catch {
+            XCTFail("Expected MeetingASRPreparationError, got \(error)")
+        }
+        XCTAssertEqual(harness.provider.prepareCalls, 1)
+
+        finishBody.open()
+        let firstResult = try await first.value
+        XCTAssertEqual(firstResult, "first")
+        XCTAssertEqual(harness.recorder.count(of: "drain"), 1)
+        XCTAssertFalse(harness.owner.isClaimed)
+    }
+
+    func testScopeCancellationWithNonCooperativePrepareDrainsBeforeReturning() async throws {
+        let harness = self.makeHarness()
+        _ = try harness.acquireMeetingLease()
+        let providerGate = ContinuationGate()
+        let entered = ContinuationGate()
+        harness.provider.blockPrepare(on: providerGate)
+        harness.provider.onPrepareEntered { entered.open() }
+
+        let scope = Task { @MainActor in
+            try await harness.service.withPreparedMeetingASR(
+                attemptID: UUID(), configuration: MeetingFinalProcessingConfiguration()
+            ) { _ in "unreachable" }
+        }
+        let enteredObserved = await waitUntilCondition { entered.opened }
+        XCTAssertTrue(enteredObserved)
+
+        scope.cancel()
+        // The fake prepare ignores cancellation: the claim stays until it returns.
+        XCTAssertTrue(harness.owner.isClaimed)
+        XCTAssertEqual(harness.recorder.count(of: "drain"), 0)
+
+        providerGate.open()
+        do {
+            _ = try await scope.value
+            XCTFail("Expected cancelled scope to throw")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+        XCTAssertEqual(harness.recorder.count(of: "retire"), 1)
+        XCTAssertEqual(harness.recorder.count(of: "drain"), 1)
+        XCTAssertFalse(harness.owner.isClaimed)
+        XCTAssertFalse(harness.owner.isDraining)
+    }
+
+    func testScopeCancellationDuringNonCooperativeBodySuppressesLateSuccess() async throws {
+        let harness = self.makeHarness()
+        _ = try harness.acquireMeetingLease()
+        let bodyEntered = ContinuationGate()
+        let finishBody = ContinuationGate()
+
+        let scope = Task { @MainActor in
+            try await harness.service.withPreparedMeetingASR(
+                attemptID: UUID(), configuration: MeetingFinalProcessingConfiguration()
+            ) { _ in
+                bodyEntered.open()
+                // Deliberately ignores cancellation until the test releases it.
+                await finishBody.wait()
+                return "late success"
+            }
+        }
+        let enteredObserved = await waitUntilCondition { bodyEntered.opened }
+        XCTAssertTrue(enteredObserved)
+
+        scope.cancel()
+        XCTAssertTrue(harness.owner.isClaimed)
+        XCTAssertEqual(harness.recorder.count(of: "drain"), 0)
+
+        finishBody.open()
+        do {
+            _ = try await scope.value
+            XCTFail("Expected cancellation to suppress the body's late success")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+
+        XCTAssertEqual(harness.recorder.count(of: "drain"), 1)
+        XCTAssertFalse(harness.owner.isClaimed)
+        XCTAssertFalse(harness.owner.isDraining)
+    }
+
+    func testTerminationCancelsAndJoinsNonCooperativeScopeBodyBeforeReleasingClaim() async throws {
+        let harness = self.makeHarness()
+        _ = try harness.acquireMeetingLease()
+        let bodyEntered = ContinuationGate()
+        let bodyCancellationObserved = ContinuationGate()
+        let finishBody = ContinuationGate()
+        let shutdownFinished = TestFlag()
+
+        let scope = Task { @MainActor in
+            try await harness.service.withPreparedMeetingASR(
+                attemptID: UUID(), configuration: MeetingFinalProcessingConfiguration()
+            ) { _ in
+                bodyEntered.open()
+                return await withTaskCancellationHandler {
+                    await finishBody.wait()
+                    return "late success"
+                } onCancel: {
+                    bodyCancellationObserved.open()
+                }
+            }
+        }
+        let didEnterBody = await waitUntilCondition { bodyEntered.opened }
+        XCTAssertTrue(didEnterBody)
+
+        let shutdown = Task { @MainActor in
+            await harness.service.shutdownForTermination()
+            shutdownFinished.set(true)
+        }
+        let didObserveCancellation = await waitUntilCondition { bodyCancellationObserved.opened }
+        XCTAssertTrue(didObserveCancellation)
+
+        // Cancellation was delivered, but shutdown remains joined to the deliberately
+        // non-cooperative body and cannot clear its model claim early.
+        XCTAssertFalse(shutdownFinished.value)
+        XCTAssertTrue(harness.owner.isClaimed)
+
+        finishBody.open()
+        do {
+            _ = try await scope.value
+            XCTFail("Expected termination cancellation to suppress late success")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+        await shutdown.value
+
+        XCTAssertTrue(shutdownFinished.value)
+        XCTAssertEqual(harness.recorder.count(of: "drain"), 1)
+        XCTAssertFalse(harness.owner.isClaimed)
+        XCTAssertFalse(harness.owner.isDraining)
+    }
+
+    func testLeaseReleaseRequestedDuringScopeDefersUntilJoinedDrain() async throws {
+        let harness = self.makeHarness()
+        let lease = try harness.acquireMeetingLease()
+        let bodyEntered = ContinuationGate()
+        let finishBody = ContinuationGate()
+
+        let scope = Task { @MainActor in
+            try await harness.service.withPreparedMeetingASR(
+                attemptID: UUID(), configuration: MeetingFinalProcessingConfiguration()
+            ) { _ in
+                bodyEntered.open()
+                await finishBody.wait()
+                return "done"
+            }
+        }
+        let enteredObserved = await waitUntilCondition { bodyEntered.opened }
+        XCTAssertTrue(enteredObserved)
+
+        // A mid-scope release request (as the meeting handback performs) must not hand
+        // ownership to dictation while the scope owns the provider and executor.
+        harness.service.releaseExclusiveActivity(lease)
+        XCTAssertThrowsError(try harness.service.acquireExclusiveActivity(.dictation)) { error in
+            guard let activityError = error as? ASRActivityError,
+                  case .activityInProgress(.meeting) = activityError
+            else {
+                return XCTFail("Expected the meeting lease to survive mid-scope, got \(error)")
+            }
+        }
+        XCTAssertTrue(harness.owner.isClaimed)
+
+        finishBody.open()
+        let result = try await scope.value
+        XCTAssertEqual(result, "done")
+        XCTAssertEqual(harness.recorder.count(of: "drain"), 1)
+
+        // After the joined drain the deferred release flushed exactly that lease.
+        let dictationLease = try harness.service.acquireExclusiveActivity(.dictation)
+        harness.service.releaseExclusiveActivity(dictationLease)
+        XCTAssertFalse(harness.owner.isClaimed)
+    }
+
+    func testMeetingTranscriptionEntryPointsRunWithinScopeAndUnclaimedLegacyPath() async throws {
+        let harness = self.makeHarness()
+        _ = try harness.acquireMeetingLease()
+        let samples = [Float](repeating: 0, count: 16_000)
+
+        let scopedText = try await harness.service.withPreparedMeetingASR(
+            attemptID: UUID(), configuration: MeetingFinalProcessingConfiguration()
+        ) { provider in
+            try await harness.service.transcribeMeetingSamples(
+                samples, provider: provider, languageCode: "en"
+            ).text
+        }
+        XCTAssertEqual(scopedText, "")
+        XCTAssertEqual(harness.recorder.count(of: "drain"), 1)
+
+        // Unclaimed legacy meeting transcription still runs without any scope.
+        let legacy = try await harness.service.transcribeMeetingSamples(
+            samples, provider: harness.provider, languageCode: "en"
+        )
+        XCTAssertEqual(legacy.text, "")
+    }
+
+    func testRetireDictationResourcesRequiresExactLeaseAndDropsCachedProviders() async throws {
+        let service = ASRService()
+        let settings = SettingsStore.shared
+        let originalModel = settings.selectedSpeechModel
+        defer { settings.selectedSpeechModel = originalModel }
+        settings.selectedSpeechModel = .parakeetTDT
+
+        let lease = try service.acquireExclusiveActivity(.meeting)
+        defer { service.releaseExclusiveActivity(lease) }
+        let cached = service.fileTranscriptionProvider
+        let cachedID = ObjectIdentifier(cached as AnyObject)
+
+        // A stale or foreign meeting lease must not retire anything.
+        let foreignLease = ASRActivityLease(id: UUID(), activity: .meeting)
+        do {
+            try await service.retireDictationASRResourcesForMeeting(lease: foreignLease)
+            XCTFail("Expected stale lease rejection")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+        XCTAssertEqual(ObjectIdentifier(service.fileTranscriptionProvider as AnyObject), cachedID)
+
+        try await service.retireDictationASRResourcesForMeeting(lease: lease)
+        XCTAssertFalse(service.isAsrReady)
+        let recreated = service.fileTranscriptionProvider
+        XCTAssertNotEqual(ObjectIdentifier(recreated as AnyObject), cachedID)
+    }
+
+    func testMeetingProviderConstructionIgnoresDictationPreferences() throws {
+        let settings = SettingsStore.shared
+        let originalModel = settings.selectedSpeechModel
+        let originalBoosting = settings.vocabularyBoostingEnabled
+        defer {
+            settings.selectedSpeechModel = originalModel
+            settings.vocabularyBoostingEnabled = originalBoosting
+        }
+        // Dictation preferences differ from the fixed meeting policy on every axis.
+        settings.selectedSpeechModel = .parakeetTDT
+        settings.vocabularyBoostingEnabled = true
+
+        let provider = try FluidAudioProvider(meetingConfiguration: MeetingFinalProcessingConfiguration())
+        XCTAssertEqual(provider.modelOverride, .parakeetTDTv2)
+        #if DEBUG
+            let options = provider.effectiveEnhancementOptionsForTesting
+            XCTAssertFalse(options.experimentalUnifiedFinalEnabled)
+            XCTAssertFalse(options.pronunciationMatchingEnabled)
+            XCTAssertTrue(options.customDictionaryEntries.isEmpty)
+        #endif
+        // Dictation selection is untouched by meeting provider construction.
+        XCTAssertEqual(settings.selectedSpeechModel, .parakeetTDT)
+    }
+
+    func testDictationReadinessAndDownloadsRejectedWhileScopeClaimed() async throws {
+        let harness = self.makeHarness()
+        _ = try harness.acquireMeetingLease()
+        let bodyEntered = ContinuationGate()
+        let finishBody = ContinuationGate()
+
+        let scope = Task { @MainActor in
+            try await harness.service.withPreparedMeetingASR(
+                attemptID: UUID(), configuration: MeetingFinalProcessingConfiguration()
+            ) { _ in
+                bodyEntered.open()
+                await finishBody.wait()
+                return "done"
+            }
+        }
+        let enteredObserved = await waitUntilCondition { bodyEntered.opened }
+        XCTAssertTrue(enteredObserved)
+
+        do {
+            try await harness.service.ensureAsrReady()
+            XCTFail("Expected ensureAsrReady rejection while the scope is claimed")
+        } catch let error as MeetingASRPreparationError {
+            XCTAssertEqual(error, .preparationInProgress)
+        } catch {
+            XCTFail("Expected MeetingASRPreparationError, got \(error)")
+        }
+        do {
+            try await harness.service.downloadModel(.whisperBase, progressHandler: nil)
+            XCTFail("Expected download rejection while the scope is claimed")
+        } catch let error as MeetingASRPreparationError {
+            XCTAssertEqual(error, .preparationInProgress)
+        } catch {
+            XCTFail("Expected MeetingASRPreparationError, got \(error)")
+        }
+
+        finishBody.open()
+        _ = try await scope.value
+        XCTAssertFalse(harness.owner.isClaimed)
+    }
+}
+#endif

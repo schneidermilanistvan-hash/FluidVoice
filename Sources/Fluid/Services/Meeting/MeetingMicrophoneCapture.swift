@@ -166,9 +166,18 @@ nonisolated func meetingMicrophoneSynthesizeSampleBuffer(
     from buffer: AVAudioPCMBuffer,
     presentationTime: CMTime
 ) -> CMSampleBuffer? {
-    guard buffer.frameLength > 0, let channelData = buffer.floatChannelData else { return nil }
+    guard buffer.frameLength > 0 else { return nil }
+    let frameCount = Int(buffer.frameLength)
+    let channelCount = Int(buffer.format.channelCount)
+    guard channelCount > 0 else { return nil }
 
     var asbd = buffer.format.streamDescription.pointee
+    // CMSampleBuffer's block buffer below is canonical interleaved LPCM, regardless of whether
+    // the tap supplied planar or interleaved AVAudioPCMBuffer storage. Keep the description and
+    // payload topology truthful so downstream sinks can validate frame/byte totals.
+    asbd.mFormatFlags &= ~kAudioFormatFlagIsNonInterleaved
+    asbd.mBytesPerFrame = UInt32(channelCount * MemoryLayout<Float>.size)
+    asbd.mBytesPerPacket = asbd.mBytesPerFrame
     var formatDescription: CMAudioFormatDescription?
     let formatStatus = CMAudioFormatDescriptionCreate(
         allocator: kCFAllocatorDefault,
@@ -182,8 +191,24 @@ nonisolated func meetingMicrophoneSynthesizeSampleBuffer(
     )
     guard formatStatus == noErr, let formatDescription else { return nil }
 
-    let frameCount = Int(buffer.frameLength)
-    let byteCount = frameCount * MemoryLayout<Float>.size
+    let byteCount = frameCount * channelCount * MemoryLayout<Float>.size
+    var interleaved = Data(count: byteCount)
+    if buffer.format.isInterleaved {
+        guard let source = buffer.audioBufferList.pointee.mBuffers.mData else { return nil }
+        interleaved.withUnsafeMutableBytes { destination in
+            destination.copyBytes(from: UnsafeRawBufferPointer(start: source, count: byteCount))
+        }
+    } else {
+        guard let channelData = buffer.floatChannelData else { return nil }
+        interleaved.withUnsafeMutableBytes { destination in
+            let output = destination.baseAddress!.assumingMemoryBound(to: Float.self)
+            for frame in 0..<frameCount {
+                for channel in 0..<channelCount {
+                    output[frame * channelCount + channel] = channelData[channel][frame]
+                }
+            }
+        }
+    }
 
     var blockBuffer: CMBlockBuffer?
     let blockStatus = CMBlockBufferCreateWithMemoryBlock(
@@ -199,12 +224,14 @@ nonisolated func meetingMicrophoneSynthesizeSampleBuffer(
     )
     guard blockStatus == noErr, let blockBuffer else { return nil }
 
-    let copyStatus = CMBlockBufferReplaceDataBytes(
-        with: channelData[0],
-        blockBuffer: blockBuffer,
-        offsetIntoDestination: 0,
-        dataLength: byteCount
-    )
+    let copyStatus = interleaved.withUnsafeBytes { bytes in
+        CMBlockBufferReplaceDataBytes(
+            with: bytes.baseAddress!,
+            blockBuffer: blockBuffer,
+            offsetIntoDestination: 0,
+            dataLength: byteCount
+        )
+    }
     guard copyStatus == noErr else { return nil }
 
     var timing = CMSampleTimingInfo(

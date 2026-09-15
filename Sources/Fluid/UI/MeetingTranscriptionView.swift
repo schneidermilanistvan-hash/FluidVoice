@@ -405,7 +405,8 @@ struct MeetingTranscriptionView: View {
         } else if self.setupDraft.mode == .onlineCall, !meetingAudioReady {
             blockingMessage = "Allow Screen & System Audio access, then refresh sources."
         } else if !self.cachedStorageReady {
-            blockingMessage = "Free at least 512 MB of storage before recording."
+            let trackCount = MeetingPCMStoragePolicy.trackCount(for: self.setupDraft.mode)
+            blockingMessage = "Free at least \(MeetingPCMStoragePolicy.requiredFreeSpaceDescription(trackCount: trackCount)) of storage before recording."
         } else {
             blockingMessage = nil
         }
@@ -802,11 +803,14 @@ struct MeetingTranscriptionView: View {
                     self.actionErrorMessage = "Captured audio could not be revealed: recording no longer on disk."
                     return
                 }
-                let firstAudioURL = freshSession.audioTracks
-                    .flatMap(\.chunks)
-                    .first(where: { $0.finalizationState == .finalized && $0.byteCount > 0 })?
-                    .fileURL(relativeTo: directory)
-                NSWorkspace.shared.activateFileViewerSelecting([firstAudioURL ?? directory])
+                guard let firstAudioURL = MeetingAudioPresentation.firstPlaybackURL(
+                    in: freshSession,
+                    directory: directory
+                ) else {
+                    self.actionErrorMessage = "Captured audio is still preparing or is no longer available on disk."
+                    return
+                }
+                NSWorkspace.shared.activateFileViewerSelecting([firstAudioURL])
             } catch {
                 self.actionErrorMessage = "Captured audio could not be revealed: \(error.localizedDescription)"
             }
@@ -1052,12 +1056,12 @@ struct MeetingTranscriptionView: View {
         self.cachedModelReady = self.asrService.isAsrReady ||
             self.asrService.modelsExistOnDisk ||
             SettingsStore.shared.selectedSpeechModel.isInstalled
-        let storage = Self.storageReadiness()
+        let storage = Self.storageReadiness(trackCount: MeetingPCMStoragePolicy.trackCount(for: self.setupDraft.mode))
         self.cachedStorageStatus = storage.status
         self.cachedStorageReady = storage.ready
     }
 
-    private static func storageReadiness() -> (status: String, ready: Bool) {
+    private static func storageReadiness(trackCount: Int) -> (status: String, ready: Bool) {
         guard let applicationSupport = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
@@ -1068,7 +1072,7 @@ struct MeetingTranscriptionView: View {
         else {
             return ("Storage availability unavailable", false)
         }
-        let requiredBytes: Int64 = 512 * 1024 * 1024
+        let requiredBytes = MeetingPCMStoragePolicy.requiredFreeBytes(trackCount: trackCount)
         let formatter = ByteCountFormatter()
         formatter.countStyle = .file
         return ("\(formatter.string(fromByteCount: capacity)) available", capacity >= requiredBytes)

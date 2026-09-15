@@ -620,6 +620,20 @@ final class ASRService: ObservableObject {
     private var deferredMeetingRouteRecoveryReason: String?
     private var deferredMeetingRouteRecoveryRequiresPrewarm = false
     private var deferredMeetingRouteRecoveryReconcilesInput = false
+    private struct MeetingASRScope {
+        let id: UUID
+        let lease: ASRActivityLease
+        var cancelBody: (() -> Void)?
+        var awaitBodyCompletion: (() async -> Void)?
+    }
+
+    private var meetingASRPreparationOwner: MeetingASRPreparationOwner?
+    private var activeMeetingASRScope: MeetingASRScope?
+    private var deferredMeetingActivityLeaseRelease: ASRActivityLease?
+#if DEBUG
+    /// Test seam replacing the lazily wired production owner so scope tests use fake providers.
+    var meetingASRPreparationOwnerForTesting: MeetingASRPreparationOwner?
+#endif
     var isRunningOrStarting: Bool {
         self.isRunning || self.isStarting
     }
@@ -636,6 +650,11 @@ final class ASRService: ObservableObject {
 
     func releaseExclusiveActivity(_ lease: ASRActivityLease) {
         guard self.activeActivityLease == lease else { return }
+        if self.isMeetingASRClaimBlocking(lease: lease) {
+            // The exact lease is released by the scope's joined drain, never mid-scope.
+            self.deferredMeetingActivityLeaseRelease = lease
+            return
+        }
         #if DEBUG
             AudioTopologyDiagnostics.record(.phaseBegin, owner: .asrActivityLease, queueRole: .mainControl, phase: .activityLease)
             defer { AudioTopologyDiagnostics.record(.phaseEnd, owner: .asrActivityLease, queueRole: .mainControl, phase: .activityLease) }
@@ -929,6 +948,22 @@ final class ASRService: ObservableObject {
         _ = await downloadTask?.result
         await self.providerResetDrain?.task.value
         self.streamingWorkState.invalidateProvider()
+        // The scope body is independently owned because a future backend may suspend
+        // outside the CoreML executor. Termination must join that work before releasing
+        // its provider claim or the meeting activity lease.
+        if let scope = self.activeMeetingASRScope {
+            scope.cancelBody?()
+            if let awaitBodyCompletion = scope.awaitBodyCompletion {
+                await awaitBodyCompletion()
+            }
+        }
+        if let meetingOwner = self.activeMeetingASRPreparationOwner,
+           let claimToken = meetingOwner.currentClaimToken,
+           meetingOwner.isClaimed || meetingOwner.isDraining {
+            await meetingOwner.release(claimToken)
+        }
+        await self.meetingTranscriptionExecutor.cancelAndAwaitPending()
+        self.flushDeferredMeetingLeaseReleaseIfReady()
         await self.transcriptionExecutor.cancelAndAwaitPending()
 
         self.fluidAudioProvider = nil
@@ -1114,6 +1149,9 @@ final class ASRService: ObservableObject {
         source: AnalyticsModelDownloadSource = .settings,
         progressHandler: ((Double) -> Void)?
     ) async throws {
+        if self.isMeetingASRPreparationClaimed {
+            throw MeetingASRPreparationError.preparationInProgress
+        }
         guard self.modelDownloadTask == nil, self.ensureReadyTask == nil else {
             throw NSError(
                 domain: "ASRService",
@@ -1755,6 +1793,8 @@ final class ASRService: ObservableObject {
     private var benchmarkCompletedStreamingChunks: Int = 0
     private var benchmarkLastChunkSampleCount: Int = 0
     private let transcriptionExecutor = TranscriptionExecutor() // Serializes all CoreML access
+    /// Scoped meeting ASR work; drained independently of the shared legacy executor.
+    private let meetingTranscriptionExecutor = TranscriptionExecutor()
     private var providerResetDrain: (id: UUID, task: Task<Void, Never>)?
     private var engineConfigurationChangeObserver: NSObjectProtocol?
     private let audioEngineRetirementDrain = AudioEngineRetirementDrain()
@@ -3609,6 +3649,202 @@ final class ASRService: ObservableObject {
         return (ASRTranscriptionResult(text: cleanedText, confidence: result.confidence), estimatedSamples)
     }
 
+    // MARK: - Scoped Meeting ASR Preparation
+
+    private var activeMeetingASRPreparationOwner: MeetingASRPreparationOwner? {
+        #if DEBUG
+            if let injected = self.meetingASRPreparationOwnerForTesting { return injected }
+        #endif
+        return self.meetingASRPreparationOwner
+    }
+
+    private var isMeetingASRPreparationClaimed: Bool {
+        guard let owner = self.activeMeetingASRPreparationOwner else { return false }
+        return owner.isClaimed || owner.isDraining
+    }
+
+    private func meetingASROwner() -> MeetingASRPreparationOwner {
+        #if DEBUG
+            if let injected = self.meetingASRPreparationOwnerForTesting { return injected }
+        #endif
+        if let existing = self.meetingASRPreparationOwner { return existing }
+        let owner = MeetingASRPreparationOwner(
+            isActiveLease: { [weak self] lease in
+                self?.activeActivityLease == lease
+            },
+            isUserDownloadInProgress: { [weak self] in
+                self?.hasActiveModelDownload ?? false
+            },
+            retireDictationResources: { [weak self] lease in
+                guard let self else { throw CancellationError() }
+                try await self.retireDictationASRResourcesForMeeting(lease: lease)
+            },
+            makeProvider: { configuration in
+                // Fixed Parakeet TDT v2 English policy; never reads selectedSpeechModel.
+                try FluidAudioProvider(meetingConfiguration: configuration)
+            },
+            prepareProvider: { provider, _, progress in
+                try await provider.prepare(progressHandler: progress)
+            },
+            drainExecutor: { [weak self] _ in
+                await self?.meetingTranscriptionExecutor.cancelAndAwaitPending()
+            }
+        )
+        self.meetingASRPreparationOwner = owner
+        return owner
+    }
+
+    /// Drops cached dictation providers and drains the legacy executor for a claimed meeting
+    /// preparation. On-disk model caches are never deleted.
+    func retireDictationASRResourcesForMeeting(lease: ASRActivityLease) async throws {
+        guard self.activeActivityLease == lease, lease.activity == .meeting else {
+            throw CancellationError()
+        }
+        guard !self.hasActiveModelDownload else {
+            throw MeetingASRPreparationError.userModelDownloadInProgress
+        }
+
+        if let retiringTask = self.ensureReadyTask {
+            self.isCancellingModelPreparation = true
+            retiringTask.cancel()
+            _ = await retiringTask.result
+        }
+        await self.transcriptionExecutor.cancelAndAwaitPending()
+
+        guard self.activeActivityLease == lease else { throw CancellationError() }
+        self.fluidAudioProvider = nil
+        self.parakeetRealtimeProvider = nil
+        self.externalCoreMLProvider = nil
+        self.nemotronProviders.removeAll()
+        self.whisperProvider = nil
+        self.appleSpeechProvider = nil
+        self._appleSpeechAnalyzerProvider = nil
+        self.isAsrReady = false
+    }
+
+    private func isMeetingASRClaimBlocking(lease: ASRActivityLease) -> Bool {
+        guard lease.activity == .meeting else { return false }
+        if let scope = self.activeMeetingASRScope, scope.lease == lease { return true }
+        if let owner = self.activeMeetingASRPreparationOwner,
+           owner.currentClaimToken?.lease == lease,
+           owner.isClaimed || owner.isDraining {
+            return true
+        }
+        return false
+    }
+
+    private func executorForMeetingTranscription() -> TranscriptionExecutor {
+        if self.activeMeetingASRScope != nil || self.isMeetingASRPreparationClaimed {
+            return self.meetingTranscriptionExecutor
+        }
+        return self.transcriptionExecutor
+    }
+
+    /// Runs `body` with the dedicated fixed-configuration meeting ASR provider. Requires the
+    /// active meeting lease; one scope at a time. Release/drain is awaited on success, error,
+    /// and cancellation before the scope clears and any deferred lease release flushes.
+    @discardableResult
+    func withPreparedMeetingASR<Result>(
+        attemptID: UUID,
+        configuration: MeetingFinalProcessingConfiguration,
+        body: @escaping (any TranscriptionProvider) async throws -> Result
+    ) async throws -> Result {
+        try Task.checkCancellation()
+        guard let lease = self.activeActivityLease, lease.activity == .meeting else {
+            throw MeetingASRPreparationError.invalidActivityLease
+        }
+        guard self.activeMeetingASRScope == nil else {
+            throw MeetingASRPreparationError.preparationInProgress
+        }
+        let scopeID = UUID()
+        self.activeMeetingASRScope = MeetingASRScope(
+            id: scopeID,
+            lease: lease,
+            cancelBody: nil,
+            awaitBodyCompletion: nil
+        )
+
+        let owner = self.meetingASROwner()
+        let provider: any TranscriptionProvider
+        do {
+            provider = try await owner.prepare(lease: lease, attemptID: attemptID, configuration: configuration)
+        } catch {
+            // The owner already drained the failed preparation.
+            self.finishMeetingASRScope(scopeID: scopeID)
+            throw error
+        }
+        guard self.activeActivityLease == lease,
+              let token = owner.currentClaimToken, token.lease == lease
+        else {
+            if let token = owner.currentClaimToken { await owner.release(token) }
+            self.finishMeetingASRScope(scopeID: scopeID)
+            throw CancellationError()
+        }
+
+        do {
+            let bodyTask = Task { @MainActor in
+                try await body(provider)
+            }
+            guard self.activeMeetingASRScope?.id == scopeID else {
+                bodyTask.cancel()
+                _ = await bodyTask.result
+                throw CancellationError()
+            }
+            self.activeMeetingASRScope?.cancelBody = {
+                bodyTask.cancel()
+            }
+            self.activeMeetingASRScope?.awaitBodyCompletion = {
+                _ = await bodyTask.result
+            }
+            let result = try await withTaskCancellationHandler {
+                try await bodyTask.value
+            } onCancel: {
+                bodyTask.cancel()
+            }
+            // A provider/model call may not observe cooperative cancellation until it
+            // returns. Never publish that late success after the enclosing attempt was
+            // cancelled; teardown still runs below before cancellation escapes.
+            if bodyTask.isCancelled { throw CancellationError() }
+            try Task.checkCancellation()
+            await owner.release(token)
+            self.finishMeetingASRScope(scopeID: scopeID)
+            return result
+        } catch {
+            await owner.release(token)
+            self.finishMeetingASRScope(scopeID: scopeID)
+            throw error
+        }
+    }
+
+    private func finishMeetingASRScope(scopeID: UUID) {
+        if self.activeMeetingASRScope?.id == scopeID {
+            self.activeMeetingASRScope = nil
+        }
+        self.flushDeferredMeetingLeaseReleaseIfReady()
+    }
+
+    private func flushDeferredMeetingLeaseReleaseIfReady() {
+        guard let lease = self.deferredMeetingActivityLeaseRelease,
+              !self.isMeetingASRClaimBlocking(lease: lease)
+        else { return }
+        self.deferredMeetingActivityLeaseRelease = nil
+        guard self.activeActivityLease == lease else { return }
+        let reason = self.deferredMeetingRouteRecoveryReason
+        let requiresPrewarm = self.deferredMeetingRouteRecoveryRequiresPrewarm
+        let reconcilesInput = self.deferredMeetingRouteRecoveryReconcilesInput
+        self.deferredMeetingRouteRecoveryReason = nil
+        self.deferredMeetingRouteRecoveryRequiresPrewarm = false
+        self.deferredMeetingRouteRecoveryReconcilesInput = false
+        self.releaseExclusiveActivity(lease)
+        if requiresPrewarm || reason != nil {
+            self.scheduleAudioRouteRecovery(
+                reason: reason ?? "meeting audio handback",
+                requiresIdlePrewarm: requiresPrewarm,
+                reconcilesInputSelection: reconcilesInput
+            )
+        }
+    }
+
     func transcribeMeetingSamples(
         _ samples: [Float],
         provider: any TranscriptionProvider,
@@ -3617,7 +3853,7 @@ final class ASRService: ObservableObject {
         guard self.activeExclusiveActivity == .meeting else {
             throw ASRActivityError.activityInProgress(self.activeExclusiveActivity ?? .meeting)
         }
-        return try await self.transcriptionExecutor.run { [provider] in
+        return try await self.executorForMeetingTranscription().run { [provider] in
             if let whisperProvider = provider as? WhisperProvider {
                 return try await whisperProvider.transcribe(samples, languageCode: languageCode)
             }
@@ -3632,7 +3868,7 @@ final class ASRService: ObservableObject {
         guard self.activeExclusiveActivity == .meeting else {
             throw ASRActivityError.activityInProgress(self.activeExclusiveActivity ?? .meeting)
         }
-        return try await self.transcriptionExecutor.run { [provider] in
+        return try await self.executorForMeetingTranscription().run { [provider] in
             try await provider.transcribeWithWordTimings(samples)
         }
     }
@@ -3644,7 +3880,7 @@ final class ASRService: ObservableObject {
         guard self.activeExclusiveActivity == .meeting else {
             throw ASRActivityError.activityInProgress(self.activeExclusiveActivity ?? .meeting)
         }
-        return try await self.transcriptionExecutor.run { [provider] in
+        return try await self.executorForMeetingTranscription().run { [provider] in
             try await provider.transcribeFile(at: fileURL)
         }
     }
@@ -5402,6 +5638,10 @@ final class ASRService: ObservableObject {
             if self.providerResetDrain?.id == drain.id {
                 self.providerResetDrain = nil
             }
+        }
+        // Unclaimed behavior is unchanged; a claimed scope blocks re-seeding retired caches.
+        if self.isMeetingASRPreparationClaimed {
+            throw MeetingASRPreparationError.preparationInProgress
         }
         let provider = self.transcriptionProvider
         let model = SettingsStore.shared.selectedSpeechModel

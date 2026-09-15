@@ -53,7 +53,10 @@ actor MeetingCaptureEngine: MeetingCaptureControlling {
         }
         self.startingSessionID = session.id
         defer { self.startingSessionID = nil }
-        try Self.preflightStorage(at: sessionDirectory)
+        try Self.preflightStorage(
+            at: sessionDirectory,
+            trackCount: MeetingPCMStoragePolicy.trackCount(for: configuration.mode)
+        )
         try Self.verifyMicrophonePermission()
 
         let tracks = Self.makeTracks(session: session, configuration: configuration)
@@ -396,9 +399,10 @@ actor MeetingCaptureEngine: MeetingCaptureControlling {
         })
     }
 
-    private nonisolated static func preflightStorage(at directory: URL) throws {
+    private nonisolated static func preflightStorage(at directory: URL, trackCount: Int) throws {
         let values = try directory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-        if let capacity = values.volumeAvailableCapacityForImportantUsage, capacity < 512 * 1024 * 1024 {
+        let required = MeetingPCMStoragePolicy.requiredFreeBytes(trackCount: trackCount)
+        guard let capacity = values.volumeAvailableCapacityForImportantUsage, capacity >= required else {
             throw MeetingCaptureError.insufficientDiskSpace
         }
     }
@@ -2495,7 +2499,7 @@ nonisolated enum MeetingCaptureError: LocalizedError {
         case let .screenCapturePermissionDenied(detail):
             return "Screen & System Audio permission is required. \(detail)"
         case .insufficientDiskSpace:
-            return "At least 512 MB of free space is required to start recording."
+            return "Not enough free space is available for PCM meeting capture. Free space for at least a one-hour recording and processing workspace, then try again."
         case let .captureStartFailed(detail):
             return "Meeting recording could not start. \(detail)"
         case let .captureStopFailed(detail, _):

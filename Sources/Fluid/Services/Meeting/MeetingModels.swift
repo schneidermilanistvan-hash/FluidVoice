@@ -54,6 +54,8 @@ nonisolated enum MeetingInterruptionKind: String, Codable, Sendable {
     case voiceProcessingDeclined
     case voiceProcessingConfigurationChanged
     case voiceProcessingOverload
+    /// Final processing completed with typed gaps or quarantined evidence.
+    case transcriptCoverageIncomplete
 }
 
 nonisolated enum MeetingFailureDomain: String, Codable, Sendable {
@@ -91,6 +93,17 @@ nonisolated enum MeetingTranscriptOverlap: String, Codable, Sendable {
 
 nonisolated enum MeetingTranscriptCoverageGapReason: String, Codable, Sendable {
     case unprotectedMicrophone
+    // Canonical-assembly reasons (C2b2). Additive: old sessions keep decoding, and legacy output
+    // still only ever reports `unprotectedMicrophone`.
+    case missingOrUnreadableAudio
+    case processingFailed
+    case processingSkipped
+    case providerTruncated
+    /// An indivisible unit touched an excluded interval; its admissible portion is incomplete.
+    case excludedUnitIncompleteCoverage
+    /// Canonical admission rejected the capture era because positive echo-protection provenance
+    /// was absent or unsafe. Kept distinct from the legacy `unprotectedMicrophone` label.
+    case inadmissibleCaptureEra
 }
 
 nonisolated struct MeetingTranscriptCoverageGap: Codable, Equatable, Sendable {
@@ -333,6 +346,83 @@ nonisolated struct MeetingAudioChunk: Codable, Identifiable, Equatable, Sendable
     var sha256: String
     var byteCount: Int64
     var finalizationState: MeetingAudioChunkFinalizationState
+    /// P0a additive metadata. Nil is deliberately omitted to preserve the legacy JSON shape.
+    /// Once a later activation writes these fields, old-build-read-new compatibility is not
+    /// claimed; this P0a slice writes none of them from production capture.
+    var audioSchemaVersion: Int? = nil
+    var captureAnalysisAsset: MeetingAudioAsset? = nil
+    var playbackArchiveAsset: MeetingAudioAsset? = nil
+
+    init(
+        id: MeetingAudioChunkID,
+        sequence: Int,
+        relativeFilePath: String,
+        presentationStart: MeetingMediaTime,
+        presentationEnd: MeetingMediaTime,
+        discontinuities: [MeetingAudioDiscontinuity],
+        sha256: String,
+        byteCount: Int64,
+        finalizationState: MeetingAudioChunkFinalizationState,
+        audioSchemaVersion: Int? = nil,
+        captureAnalysisAsset: MeetingAudioAsset? = nil,
+        playbackArchiveAsset: MeetingAudioAsset? = nil
+    ) {
+        self.id = id; self.sequence = sequence; self.relativeFilePath = relativeFilePath
+        self.presentationStart = presentationStart; self.presentationEnd = presentationEnd
+        self.discontinuities = discontinuities; self.sha256 = sha256; self.byteCount = byteCount
+        self.finalizationState = finalizationState; self.audioSchemaVersion = audioSchemaVersion
+        self.captureAnalysisAsset = captureAnalysisAsset; self.playbackArchiveAsset = playbackArchiveAsset
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, sequence, relativeFilePath, presentationStart, presentationEnd, discontinuities
+        case sha256, byteCount, finalizationState, audioSchemaVersion, captureAnalysisAsset, playbackArchiveAsset
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(MeetingAudioChunkID.self, forKey: .id)
+        self.sequence = try c.decode(Int.self, forKey: .sequence)
+        self.relativeFilePath = try c.decode(String.self, forKey: .relativeFilePath)
+        self.presentationStart = try c.decode(MeetingMediaTime.self, forKey: .presentationStart)
+        self.presentationEnd = try c.decode(MeetingMediaTime.self, forKey: .presentationEnd)
+        self.discontinuities = try c.decode([MeetingAudioDiscontinuity].self, forKey: .discontinuities)
+        self.sha256 = try c.decode(String.self, forKey: .sha256)
+        self.byteCount = try c.decode(Int64.self, forKey: .byteCount)
+        self.finalizationState = try c.decode(MeetingAudioChunkFinalizationState.self, forKey: .finalizationState)
+        self.audioSchemaVersion = try c.decodeIfPresent(Int.self, forKey: .audioSchemaVersion)
+        self.captureAnalysisAsset = try c.decodeIfPresent(MeetingAudioAsset.self, forKey: .captureAnalysisAsset)
+        self.playbackArchiveAsset = try c.decodeIfPresent(MeetingAudioAsset.self, forKey: .playbackArchiveAsset)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(self.id, forKey: .id); try c.encode(self.sequence, forKey: .sequence)
+        try c.encode(self.relativeFilePath, forKey: .relativeFilePath)
+        try c.encode(self.presentationStart, forKey: .presentationStart); try c.encode(self.presentationEnd, forKey: .presentationEnd)
+        try c.encode(self.discontinuities, forKey: .discontinuities); try c.encode(self.sha256, forKey: .sha256)
+        try c.encode(self.byteCount, forKey: .byteCount); try c.encode(self.finalizationState, forKey: .finalizationState)
+        try c.encodeIfPresent(self.audioSchemaVersion, forKey: .audioSchemaVersion)
+        try c.encodeIfPresent(self.captureAnalysisAsset, forKey: .captureAnalysisAsset)
+        try c.encodeIfPresent(self.playbackArchiveAsset, forKey: .playbackArchiveAsset)
+    }
+
+    func assetValidationIssues() -> [MeetingAudioAssetValidationIssue] {
+        var issues: [MeetingAudioAssetValidationIssue] = []
+        if let captureAnalysisAsset {
+            issues.append(contentsOf: captureAnalysisAsset.validationIssues())
+            if captureAnalysisAsset.role != .captureAnalysis {
+                issues.append(.encodingRoleContradiction)
+            }
+        }
+        if let playbackArchiveAsset {
+            issues.append(contentsOf: playbackArchiveAsset.validationIssues())
+            if playbackArchiveAsset.role != .playbackArchive {
+                issues.append(.encodingRoleContradiction)
+            }
+        }
+        return issues
+    }
 
     func fileURL(relativeTo sessionDirectory: URL) -> URL {
         sessionDirectory.appendingPathComponent(self.relativeFilePath, isDirectory: false)
@@ -671,7 +761,16 @@ nonisolated struct MeetingTranscriptSegment: Codable, Identifiable, Equatable, S
     /// Optional so pre-fix manifests still decode; a non-optional default would `keyNotFound`.
     var isLikelyEcho: Bool? = nil
 
-    var isEcho: Bool { self.isLikelyEcho == true }
+    var isEcho: Bool {
+        self.isLikelyEcho == true
+    }
+}
+
+/// Persisted product transcript timestamps are elapsed seconds from the meeting's presentation
+/// origin. Optional on `MeetingSession` so legacy sessions and canonical sessions written before
+/// the contract was explicit remain decodable and can be handled separately.
+nonisolated enum MeetingTranscriptTimeDomain: String, Codable, Sendable {
+    case meetingRelative
 }
 
 nonisolated struct MeetingProcessingAttempt: Codable, Identifiable, Equatable, Sendable {
@@ -686,6 +785,10 @@ nonisolated struct MeetingProcessingAttempt: Codable, Identifiable, Equatable, S
     var diarizationModel: String?
     var lastCompletedTrackID: MeetingAudioTrackID?
     var errorCode: String?
+    /// Actual backend lineage for canonical attempts. Optional so attempts recorded before the
+    /// backend abstraction existed decode unchanged; legacy attempts leave these nil.
+    var backendID: String? = nil
+    var backendVersion: String? = nil
 }
 
 nonisolated struct MeetingRetentionState: Codable, Equatable, Sendable {
@@ -755,6 +858,16 @@ nonisolated struct MeetingSession: Codable, Identifiable, Equatable, Sendable {
     var transcriptSegments: [MeetingTranscriptSegment]
     /// Audio intervals intentionally excluded from the transcript. Optional for schema-1 sessions.
     var transcriptCoverageGaps: [MeetingTranscriptCoverageGap]? = nil
+    /// Verified reference to the canonical attempt's durable result sidecar inside this session's
+    /// directory. Optional and backward compatible: sessions written before canonical publication
+    /// decode `nil`. Retention and deletion follow the session directory itself.
+    var resultSidecarReference: MeetingResultSidecarReference? = nil
+    /// Canonical transcript completeness. `nil` for older and legacy sessions whose existing
+    /// completeness semantics remain unchanged.
+    var transcriptIsComplete: Bool? = nil
+    /// Explicit for canonical sessions published after the timeline-domain fix. A nil value on a
+    /// canonical session with a result sidecar identifies the one-time absolute-host-time migration.
+    var transcriptTimeDomain: MeetingTranscriptTimeDomain? = nil
     var retention: MeetingRetentionState
     var processingAttempts: [MeetingProcessingAttempt]
     var updatedAt: Date
@@ -1133,6 +1246,10 @@ nonisolated struct MeetingProcessingResult: Sendable {
     var attempt: MeetingProcessingAttempt
     var skippedChunkIDs: [MeetingAudioChunkID] = []
     var coverageGaps: [MeetingTranscriptCoverageGap] = []
+    /// Present only on the canonical path: the sidecar was written and read-back verified before
+    /// this result was returned, so the coordinator may persist the reference with the session.
+    var resultSidecarReference: MeetingResultSidecarReference? = nil
+    var isComplete: Bool = true
 }
 
 /// Resume point written after the application-audio pass so a retry can skip re-diarizing and
@@ -1180,9 +1297,12 @@ nonisolated struct MeetingProcessingCheckpoint: Codable, Equatable, Sendable {
 
     static func fingerprints(for tracks: [MeetingAudioTrack]) -> [MeetingAudioTrackID: [ChunkFingerprint]] {
         Dictionary(uniqueKeysWithValues: tracks.map { track in
-            (track.id, track.chunks
-                .filter { $0.finalizationState == .finalized && $0.byteCount > 0 }
-                .map { ChunkFingerprint(id: $0.id, byteCount: $0.byteCount, sha256: $0.sha256) })
+            (
+                track.id,
+                track.chunks
+                    .filter { $0.finalizationState == .finalized && $0.byteCount > 0 }
+                    .map { ChunkFingerprint(id: $0.id, byteCount: $0.byteCount, sha256: $0.sha256) }
+            )
         })
     }
 

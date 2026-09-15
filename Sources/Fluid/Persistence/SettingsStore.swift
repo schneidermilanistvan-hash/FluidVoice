@@ -1954,6 +1954,24 @@ final class SettingsStore: ObservableObject {
         }
     }
 
+    /// Which meeting transcription backend final processing should use.
+    ///
+    /// An absent preference resolves to the current production default. A stored value is handed
+    /// through verbatim, including an ID this build does not know: the pipeline rejects an unknown
+    /// selection loudly rather than quietly transcribing with a different backend than the one
+    /// that was chosen. An explicit legacy selection therefore remains a reliable rollback switch.
+    var meetingTranscriptionBackendID: MeetingBackendID {
+        get {
+            guard let raw = self.defaults.string(forKey: Keys.meetingTranscriptionBackendID)
+            else { return .productionDefault }
+            return MeetingBackendID(rawValue: raw)
+        }
+        set {
+            objectWillChange.send()
+            self.defaults.set(newValue.rawValue, forKey: Keys.meetingTranscriptionBackendID)
+        }
+    }
+
     /// Tier 1 native (Zoom/Teams/Webex) meeting auto-detection (default: ON).
     var meetingAutoDetectEnabled: Bool {
         get {
@@ -3329,6 +3347,7 @@ final class SettingsStore: ObservableObject {
             selectedCohereLanguage: self.selectedCohereLanguage,
             selectedNemotronLanguage: self.selectedNemotronLanguage,
             selectedAppleSpeechLocaleIdentifier: self.selectedAppleSpeechLocaleIdentifier,
+            meetingTranscriptionBackendID: self.meetingTranscriptionBackendID.rawValue,
             hotkeyShortcut: self.hotkeyShortcut,
             primaryDictationShortcuts: self.primaryDictationShortcuts,
             promptModeHotkeyShortcut: self.promptModeHotkeyShortcut,
@@ -3461,6 +3480,11 @@ final class SettingsStore: ObservableObject {
         if let selectedAppleSpeechLocaleIdentifier = payload.selectedAppleSpeechLocaleIdentifier {
             self.selectedAppleSpeechLocaleIdentifier = selectedAppleSpeechLocaleIdentifier
         }
+        // A backup predating this setting represents an absent selection, which resolves to the
+        // current phase's local default. Unknown stored IDs remain intact and visibly unavailable.
+        self.meetingTranscriptionBackendID = payload.meetingTranscriptionBackendID.map {
+            MeetingBackendID(rawValue: $0)
+        } ?? .productionDefault
         self.primaryDictationShortcuts = payload.primaryDictationShortcuts ?? [payload.hotkeyShortcut]
         self.promptModeHotkeyShortcut = payload.promptModeHotkeyShortcut
         self.promptModeShortcutEnabled = payload.promptModeShortcutEnabled
@@ -5504,6 +5528,7 @@ private extension SettingsStore {
         static let preferredOutputDeviceUID = "PreferredOutputDeviceUID"
         static let meetingRecordingDefaults = "MeetingRecordingDefaults"
         static let meetingAudioRetentionPolicy = "MeetingAudioRetentionPolicy"
+        static let meetingTranscriptionBackendID = "MeetingTranscriptionBackendID"
         static let meetingAutoDetectEnabled = "MeetingAutoDetectEnabled"
         static let meetingAutoDetectBrowserEnabled = "MeetingAutoDetectBrowserEnabled"
         static let microphoneSelectionMode = "MicrophoneSelectionMode"

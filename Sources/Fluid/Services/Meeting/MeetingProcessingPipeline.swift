@@ -18,8 +18,8 @@ actor MeetingProcessingSerializationGate {
     private var isLeased = false
     private var waiters: [(id: UUID, continuation: CheckedContinuation<Void, Error>)] = []
     private var cancelledWaiterIDs: Set<UUID> = []
-    // Pending = created but not parked: lets cancelWaiter tell "not yet registered" (tombstone)
-    // from "already resumed by release()" (no-op), so tombstones can't accumulate forever.
+    /// Pending = created but not parked: lets cancelWaiter tell "not yet registered" (tombstone)
+    /// from "already resumed by release()" (no-op), so tombstones can't accumulate forever.
     private var pendingWaiterIDs: Set<UUID> = []
 
     func acquire() async throws {
@@ -67,8 +67,8 @@ actor MeetingProcessingSerializationGate {
 
 /// Keeps only one normalized centroid per session speaker. Matching is
 /// conservative and one-to-one within each writer chunk to avoid false merges.
-nonisolated struct MeetingSpeakerEmbeddingIndex: Sendable {
-    nonisolated struct Prototype: Equatable, Sendable {
+nonisolated struct MeetingSpeakerEmbeddingIndex {
+    nonisolated struct Prototype: Equatable {
         var speakerID: SessionSpeakerID
         var embedding: [Float]
         var observationCount: Int
@@ -187,8 +187,8 @@ nonisolated struct MeetingSpeakerEmbeddingIndex: Sendable {
 /// state, and it never uses observation order as an identity signal. Quality is a diarizer
 /// quality metric, not a probability; it is used with speech duration only for the explicit
 /// eligibility gates below.
-nonisolated struct MeetingGlobalSpeakerStitcher: Sendable {
-    nonisolated struct Observation: Sendable, Equatable {
+nonisolated struct MeetingGlobalSpeakerStitcher {
+    nonisolated struct Observation: Equatable {
         let key: String
         let chunkKey: String
         let trackKind: MeetingAudioTrackKind
@@ -216,7 +216,7 @@ nonisolated struct MeetingGlobalSpeakerStitcher: Sendable {
         }
     }
 
-    nonisolated struct Prototype: Sendable, Equatable {
+    nonisolated struct Prototype: Equatable {
         let speakerID: SessionSpeakerID
         let embedding: [Float]
         let observationCount: Int
@@ -225,13 +225,13 @@ nonisolated struct MeetingGlobalSpeakerStitcher: Sendable {
         let containsReliableCore: Bool
     }
 
-    nonisolated struct Result: Sendable, Equatable {
+    nonisolated struct Result: Equatable {
         let speakerIDByObservationKey: [String: SessionSpeakerID]
         let prototypes: [SessionSpeakerID: Prototype]
     }
 
     /// These thresholds are intentionally named and injectable so behavior can be pinned by tests.
-    struct Configuration: Sendable, Equatable {
+    struct Configuration: Equatable {
         var coreMaximumDistance: Float = 0.35
         var deferredMaximumDistance: Float = 0.25
         var deferredAmbiguityMargin: Float = 0.10
@@ -423,11 +423,11 @@ nonisolated struct MeetingGlobalSpeakerStitcher: Sendable {
                         first.chunkKey == second.chunkKey && first.localLabel != second.localLabel
                     }
                 }),
-                      self.coreClustersRespectDiameter(clusters[left], clusters[right]),
-                      let distance = MeetingSpeakerEmbeddingIndex.cosineDistance(
-                          clusters[left].embedding, clusters[right].embedding
-                      ),
-                      distance <= self.configuration.coreMaximumDistance
+                    self.coreClustersRespectDiameter(clusters[left], clusters[right]),
+                    let distance = MeetingSpeakerEmbeddingIndex.cosineDistance(
+                        clusters[left].embedding, clusters[right].embedding
+                    ),
+                    distance <= self.configuration.coreMaximumDistance
                 else { continue }
                 let candidate = (left, right, distance)
                 if best == nil || distance < best!.distance
@@ -557,7 +557,7 @@ nonisolated enum MeetingNearFieldGate {
     }
 
     static func isNearField(rms: Double, reference: Double?) -> Bool {
-        guard rms >= Self.absoluteFloorRMS else { return false }
+        guard rms >= self.absoluteFloorRMS else { return false }
         guard let reference, reference > 0 else { return true }
         return rms >= reference * pow(10, -Self.rejectionDepthDB / 20)
     }
@@ -656,16 +656,15 @@ private final class MeetingProviderLanguagePin {
 final class MeetingProcessingPipeline: MeetingProcessingControlling {
     /// Bump whenever classification rules change so a resumed run can't mix rules mid-session.
     /// Era-awareness did NOT bump this: the mic pass re-runs every time, and multi-era tracks cannot predate this build.
-    static let pipelineVersion = 10
+    static let pipelineVersion = 11
     /// Per-turn engines starve on short turns, and an all-empty chunk collapses to unlabeled.
     static let perTurnTurnMergeGapSeconds = 5.0
 
     /// Gap alone produced ~59s turns, too coarse to attribute. Bound the length as well.
     static let meetingTurnMaxSeconds = 30.0
 
-
     nonisolated static func turnMergeGapSeconds(supportsWordTimings: Bool) -> TimeInterval {
-        supportsWordTimings ? Self.meetingTurnMergeGapSeconds : Self.perTurnTurnMergeGapSeconds
+        supportsWordTimings ? self.meetingTurnMergeGapSeconds : self.perTurnTurnMergeGapSeconds
     }
 
     /// Claiming the whole chunk marks every concurrent mic turn as overlapping remote, erasing
@@ -704,7 +703,7 @@ final class MeetingProcessingPipeline: MeetingProcessingControlling {
         prototypeSpeakerIDs: Set<SessionSpeakerID>
     ) -> SessionSpeakerID? {
         MeetingLocalSpeakerEvidenceSelector.candidate(
-            evidenceDurationByCluster: Self.localSpeakerEvidence(
+            evidenceDurationByCluster: self.localSpeakerEvidence(
                 from: turns.map {
                     (
                         clusterID: $0.clusterID, start: $0.start, end: $0.end,
@@ -849,7 +848,7 @@ final class MeetingProcessingPipeline: MeetingProcessingControlling {
         fileURL: URL,
         turns: [(start: TimeInterval, end: TimeInterval)]
     ) -> [Double] {
-        guard let samples = try? Self.readSamples(fileURL: fileURL, startSeconds: 0, endSeconds: nil),
+        guard let samples = try? readSamples(fileURL: fileURL, startSeconds: 0, endSeconds: nil),
               !samples.isEmpty
         else { return Array(repeating: 0, count: turns.count) }
         let sampleRate = 16_000.0
@@ -1022,7 +1021,9 @@ final class MeetingProcessingPipeline: MeetingProcessingControlling {
             let startIndex = max(0, Int(((interval.start - chunkOffset) * sampleRate).rounded()))
             let endIndex = min(samples.count, Int(((interval.end - chunkOffset) * sampleRate).rounded()))
             guard startIndex < endIndex else { continue }
-            for index in startIndex..<endIndex { result[index] = 0 }
+            for index in startIndex..<endIndex {
+                result[index] = 0
+            }
         }
         return result
     }
@@ -1314,13 +1315,60 @@ final class MeetingProcessingPipeline: MeetingProcessingControlling {
 
     private let asrServiceProvider: @MainActor () -> ASRService
     private let serializationGate: MeetingProcessingSerializationGate
+    private let backendRegistry: MeetingTranscriptionBackendRegistry
+    private let backendIDProvider: @MainActor () -> MeetingBackendID
+    /// Canonical path only: observes chunk files for the analysis manifest. `nil` uses the real
+    /// filesystem observer; tests inject fixture observations instead of writing audio.
+    private let chunkObserver: (any MeetingChunkAudioObserving)?
+    /// Canonical path only: an explicitly injected per-unit echo provider. Without an injection,
+    /// only the Parakeet+Nemotron backend gets its Stage E text/time provider; every other
+    /// canonical backend remains fail-closed until it wires its own evidence source.
+    private let echoVerdictProvider: (any MeetingUnitEchoVerdictProviding)?
+    /// Canonical path only: builds the composite backend's runtime for the frozen request. Tests
+    /// inject a fake here; production wires ASRService and the Nemotron model locator.
+    private let meetingRuntimeFactory: MeetingParakeetNemotronRuntimeFactory
+    /// Test seam: runs after the canonical sidecar is written and read-back verified, before the
+    /// final cancellation check, so "cancelled after sidecar" is deterministically exercisable.
+    private let canonicalSidecarVerifiedProbe: (MeetingResultSidecarReference) -> Void
 
     init(
         asrServiceProvider: @escaping @MainActor () -> ASRService,
-        serializationGate: MeetingProcessingSerializationGate = .shared
+        serializationGate: MeetingProcessingSerializationGate = .shared,
+        backendRegistry: MeetingTranscriptionBackendRegistry? = nil,
+        backendID: MeetingBackendID? = nil,
+        backendIDProvider: (@MainActor () -> MeetingBackendID)? = nil,
+        chunkObserver: (any MeetingChunkAudioObserving)? = nil,
+        echoVerdictProvider: (any MeetingUnitEchoVerdictProviding)? = nil,
+        meetingRuntimeFactory: MeetingParakeetNemotronRuntimeFactory? = nil,
+        canonicalSidecarVerifiedProbe: ((MeetingResultSidecarReference) -> Void)? = nil
     ) {
         self.asrServiceProvider = asrServiceProvider
         self.serializationGate = serializationGate
+        self.chunkObserver = chunkObserver
+        self.echoVerdictProvider = echoVerdictProvider
+        self.meetingRuntimeFactory = meetingRuntimeFactory ?? { [asrServiceProvider] _ in
+            MeetingParakeetNemotronRuntime(
+                asrServiceProvider: asrServiceProvider,
+                modelLocator: MeetingNemotronModelLocator()
+            )
+        }
+        self.canonicalSidecarVerifiedProbe = canonicalSidecarVerifiedProbe ?? { _ in }
+        let resolvedRegistry = backendRegistry ?? MeetingTranscriptionBackendRegistry.makeDefault()
+        self.backendRegistry = resolvedRegistry
+        // Resolution order, most specific first: an explicitly pinned ID never changes underneath
+        // the caller; then an injected provider; then an injected registry's own default; and only
+        // otherwise the user preference. An unknown selection is rejected in `process`, never
+        // quietly replaced.
+        if let backendID {
+            self.backendIDProvider = { backendID }
+        } else if let backendIDProvider {
+            self.backendIDProvider = backendIDProvider
+        } else if let backendRegistry {
+            let registryDefault = backendRegistry.defaultBackendID
+            self.backendIDProvider = { registryDefault }
+        } else {
+            self.backendIDProvider = { SettingsStore.shared.meetingTranscriptionBackendID }
+        }
     }
 
     func process(
@@ -1335,24 +1383,344 @@ final class MeetingProcessingPipeline: MeetingProcessingControlling {
             throw MeetingProcessingError.noRecoverableAudio
         }
 
-        try await self.serializationGate.acquire()
-        do {
-            let result = try await self.processWithLease(
-                session: session,
-                sessionDirectory: sessionDirectory,
-                progress: progress
+        // The selection is read exactly once, here, and every later decision in this attempt uses
+        // the local copy. Re-reading the preference after an await could split one attempt across
+        // two backends — planning under one, failing the legacy callback against another.
+        let backendID = self.backendIDProvider()
+        DebugLogger.shared.info(
+            "Meeting final processing selected backend=\(backendID.rawValue)",
+            source: "MeetingProcessingPipeline"
+        )
+
+        // Resolving and planning the backend happens before the serialization lease and before any
+        // model readiness work, so an unknown selection or an incompatible session fails without
+        // loading anything.
+        //
+        // The request is frozen first, so the host capability handed to the factory can be bound to
+        // this exact value.
+        let request = MeetingBackendRequest(
+            attemptID: Self.resolvedAttemptID(session: session),
+            session: session,
+            sessionDirectory: sessionDirectory,
+            configuration: MeetingFinalProcessingConfiguration(languageCode: session.languageCode)
+        )
+        let backend = try self.backendRegistry.makeBackend(
+            id: backendID,
+            context: MeetingBackendHostContext(
+                legacyExecutor: { [self] callbackRequest, progress in
+                    // The legacy path reads the session's own audio and writes its checkpoint. A
+                    // backend calling back with anything but the frozen request — a different session
+                    // snapshot, directory, attempt or configuration — is asking to transcribe audio
+                    // this call never authorized. Compared whole, not spot-checked.
+                    guard callbackRequest == request else {
+                        throw MeetingBackendError.legacyExecutorRequestMismatch(backend: backendID)
+                    }
+                    return try await self.processWithLease(
+                        session: request.session,
+                        sessionDirectory: request.sessionDirectory,
+                        attemptID: request.attemptID,
+                        progress: progress
+                    )
+                },
+                parakeetNemotronRuntimeFactory: { [self] callbackRequest in
+                    // Same binding rule as the legacy executor: the runtime is created for the
+                    // frozen request only, so the composite backend can never aim ASR/model
+                    // capabilities at a session this attempt was not given.
+                    guard callbackRequest == request else {
+                        throw MeetingBackendError.hostCapabilityRequestMismatch(backend: backendID)
+                    }
+                    return try self.meetingRuntimeFactory(callbackRequest)
+                }
             )
-            await self.serializationGate.release()
-            return result
+        )
+        let plan = try backend.plan(request)
+        if let defect = plan.agreementDefect(with: request, descriptor: backend.descriptor) {
+            throw MeetingBackendError.planDisagreesWithRequest(backend: backendID, defect: defect)
+        }
+
+        try await self.serializationGate.acquire()
+        let result: MeetingProcessingResult
+        do {
+            // Cancellation that landed while this attempt waited for the lease must not start model
+            // work: the lease can be held for a long time, and the caller has already moved on.
+            try Task.checkCancellation()
+            switch plan.resultContract {
+            case .legacyResult:
+                // No manifest is built and no sidecar is written on this path: the legacy
+                // workflow keeps its own mapping, checkpoints and byte-identical output.
+                let outcome = try await backend.execute(plan: plan, manifest: nil, progress: progress)
+                // A backend that does not cooperate with cancellation still must not publish. The
+                // caller's generation owns publication and has already been torn down, so a
+                // successful result arriving after cancellation is suppressed rather than returned.
+                try Task.checkCancellation()
+                guard case let .legacyCompatibility(legacyResult) = outcome else {
+                    throw MeetingBackendError.outcomeContractMismatch(
+                        backend: backendID, declared: .legacyResult
+                    )
+                }
+                result = legacyResult
+            case .canonicalEvidence:
+                result = try await self.processCanonicalAttempt(
+                    plan: plan,
+                    backend: backend,
+                    progress: progress
+                )
+            }
         } catch {
             await self.serializationGate.release()
             throw error
         }
+        // Exactly one release on every path: the throwing paths above, this one otherwise.
+        await self.serializationGate.release()
+        return result
+    }
+
+    /// The canonical Stage C2b2 path, run under the same serialization and cancellation ownership
+    /// as the legacy path: manifest from the frozen plan, backend execution against it, product
+    /// echo verdicts, assembly, and a written-then-read-back-verified result sidecar. Cancellation
+    /// is checked between every non-cooperative boundary, and a cancelled attempt publishes
+    /// nothing — it returns no result and references no sidecar.
+    private func processCanonicalAttempt(
+        plan: MeetingBackendPlan,
+        backend: any MeetingTranscriptionBackend,
+        progress: @escaping @MainActor (MeetingProcessingStage) -> Void
+    ) async throws -> MeetingProcessingResult {
+        let request = plan.request
+        let observer = self.chunkObserver ?? MeetingChunkAudioObserver(
+            sessionDirectory: request.sessionDirectory
+        )
+        // Chunk observation hashes and decodes real files; keep it off the main actor. The
+        // selected backend's real analysis rate is recorded on the manifest when it has one.
+        let analysisSampleRate = backend.descriptor.analysisSampleRate
+        let manifestTask = Task.detached(priority: .userInitiated) {
+            try MeetingAnalysisManifestBuilder(
+                plan: plan,
+                observer: observer,
+                analysisSampleRate: analysisSampleRate
+            ).build()
+        }
+        let manifest = try await withTaskCancellationHandler {
+            try await manifestTask.value
+        } onCancel: {
+            manifestTask.cancel()
+        }
+        try Task.checkCancellation()
+
+        let outcome = try await backend.execute(plan: plan, manifest: manifest, progress: progress)
+        try Task.checkCancellation()
+        guard case let .canonicalEvidence(bundle) = outcome else {
+            throw MeetingBackendError.outcomeContractMismatch(
+                backend: plan.backendID, declared: .canonicalEvidence
+            )
+        }
+
+        let echoProvider: any MeetingUnitEchoVerdictProviding = self.echoVerdictProvider
+            ?? (plan.backendID == .parakeetNemotron
+                ? MeetingTextOverlapEchoVerdictProvider()
+                : MeetingFailClosedEchoVerdictProvider())
+        let echoVerdicts = try await echoProvider.echoVerdicts(
+            for: bundle.evidence,
+            manifest: manifest,
+            plan: plan
+        )
+        try Task.checkCancellation()
+
+        progress(.finalizing)
+        let assemblyInput = MeetingAssemblyInput(
+            plan: plan,
+            manifest: manifest,
+            evidence: bundle.evidence,
+            coverageReceipts: bundle.coverageReceipts,
+            echoVerdicts: echoVerdicts
+        )
+        let assemblyTask = Task.detached(priority: .userInitiated) {
+            try MeetingTranscriptAssembler().assemble(assemblyInput)
+        }
+        let assembly = try await withTaskCancellationHandler {
+            try await assemblyTask.value
+        } onCancel: {
+            assemblyTask.cancel()
+        }
+        try Task.checkCancellation()
+
+        let sidecar = assembly.sidecar
+        let attemptID = plan.attemptID
+        let backendID = plan.backendID
+        let sessionDirectory = request.sessionDirectory
+        let reference = try await Task.detached(priority: .userInitiated) {
+            let store = MeetingResultSidecarStore(sessionDirectory: sessionDirectory)
+            let written = try store.write(sidecar)
+            // The write already read-back verifies; this second read is the publication gate:
+            // the reference returned below is proven against the attempt's lineage on disk.
+            _ = try store.read(
+                expectedAttemptID: attemptID,
+                expectedBackendID: backendID,
+                reference: written
+            )
+            return written
+        }.value
+        self.canonicalSidecarVerifiedProbe(reference)
+        try Task.checkCancellation()
+
+        progress(.completed)
+        return Self.canonicalResult(from: assembly, plan: plan, sidecarReference: reference)
+    }
+
+    /// Turns the validated assembly into the normal result. Attempt identity comes from the
+    /// frozen request — the still-open attempt is reused, never renumbered; lineage fields record
+    /// the actual backend and the immutable configuration snapshot, nothing is synthesized.
+    nonisolated static func canonicalResult(
+        from assembly: MeetingAssemblyResult,
+        plan: MeetingBackendPlan,
+        sidecarReference: MeetingResultSidecarReference
+    ) -> MeetingProcessingResult {
+        let request = plan.request
+        var attempt = request.session.processingAttempts
+            .last(where: { $0.completedAt == nil && $0.id == plan.attemptID })
+            ?? MeetingProcessingAttempt(
+                id: plan.attemptID,
+                startedAt: Date(),
+                completedAt: nil,
+                stage: .pending,
+                pipelineVersion: request.configuration.pipelineVersion,
+                asrProvider: nil,
+                asrModel: nil,
+                languageCode: request.configuration.languageCode,
+                diarizationModel: nil,
+                lastCompletedTrackID: nil,
+                errorCode: nil
+            )
+        attempt.stage = .completed
+        attempt.completedAt = Date()
+        attempt.pipelineVersion = request.configuration.pipelineVersion
+        attempt.asrProvider = plan.backendID.rawValue
+        attempt.asrModel = request.configuration.asrModel
+        attempt.languageCode = request.configuration.languageCode
+        attempt.diarizationModel = request.configuration.diarizationFingerprint
+        attempt.backendID = plan.backendID.rawValue
+        attempt.backendVersion = plan.backendVersion
+
+        let segments = Self.mergeCanonicalSegments(assembly.segments).map { segment in
+            var updated = segment
+            if !assembly.isComplete { updated.completeness = .incompleteTrack }
+            return updated
+        }
+
+        return MeetingProcessingResult(
+            speakers: assembly.speakers,
+            segments: segments,
+            attempt: attempt,
+            // Canonical skips remain typed coverage gaps. Unlike the legacy unreadable-chunk
+            // list, they must not mark readable source chunks failed and erase them from retries.
+            skippedChunkIDs: [],
+            coverageGaps: assembly.coverageGaps.map(Self.productCoverageGap),
+            resultSidecarReference: sidecarReference,
+            isComplete: assembly.isComplete
+        )
+    }
+
+    private nonisolated struct CanonicalSegmentMergeKey: Hashable {
+        let trackID: MeetingAudioTrackID
+        let speakerID: SessionSpeakerID?
+        let overlap: String
+        let status: String
+        let completeness: String
+        let isLikelyEcho: Bool?
+    }
+
+    /// Canonical evidence remains word-granular in the sidecar, but product session JSON and UI
+    /// rows stay turn-granular. Merge only segments with identical attribution and state, bounded
+    /// by the same 3-second/30-second policy used by aligned legacy meeting turns.
+    nonisolated static func mergeCanonicalSegments(
+        _ segments: [MeetingTranscriptSegment],
+        maximumGapSeconds: TimeInterval = 3,
+        maximumDurationSeconds: TimeInterval = 30
+    ) -> [MeetingTranscriptSegment] {
+        let grouped = Dictionary(grouping: segments) {
+            CanonicalSegmentMergeKey(
+                trackID: $0.sourceTrackID,
+                speakerID: $0.speakerID,
+                overlap: $0.overlap.rawValue,
+                status: $0.status.rawValue,
+                completeness: $0.completeness.rawValue,
+                isLikelyEcho: $0.isLikelyEcho
+            )
+        }
+        var merged: [MeetingTranscriptSegment] = []
+        for members in grouped.values {
+            let ordered = members.sorted {
+                ($0.start, $0.end, $0.id.uuidString) < ($1.start, $1.end, $1.id.uuidString)
+            }
+            guard var current = ordered.first else { continue }
+            var memberIDs = [current.id]
+            for next in ordered.dropFirst() {
+                let gap = next.start.seconds - current.end.seconds
+                let combinedDuration = max(current.end.seconds, next.end.seconds) - current.start.seconds
+                if gap <= maximumGapSeconds, combinedDuration <= maximumDurationSeconds {
+                    current.end = Self.mediaTime(max(current.end.seconds, next.end.seconds))
+                    current.text = Self.joinTranscriptText(current.text, next.text)
+                    memberIDs.append(next.id)
+                    current.id = Self.stableUUID(
+                        "canonical-merged:" + memberIDs.map(\.uuidString).joined(separator: ":")
+                    )
+                } else {
+                    merged.append(current)
+                    current = next
+                    memberIDs = [next.id]
+                }
+            }
+            merged.append(current)
+        }
+        return merged.sorted {
+            ($0.start, $0.end, $0.sourceTrackID.uuidString, $0.id.uuidString)
+                < ($1.start, $1.end, $1.sourceTrackID.uuidString, $1.id.uuidString)
+        }
+    }
+
+    private nonisolated static func joinTranscriptText(_ left: String, _ right: String) -> String {
+        guard let first = right.first else { return left }
+        if CharacterSet.punctuationCharacters.contains(first.unicodeScalars.first!) {
+            return left + right
+        }
+        return left + " " + right
+    }
+
+    /// Assembly reasons become product reasons one-to-one; only the pre-existing
+    /// `unprotectedMicrophone` label is reused, and only for its exact existing meaning —
+    /// an excluded capture era. Nothing else is relabelled as unprotected.
+    nonisolated static func productCoverageGapReason(
+        for reason: MeetingAssemblyCoverageGapReason
+    ) -> MeetingTranscriptCoverageGapReason {
+        switch reason {
+        case .inadmissibleCaptureEra: return .inadmissibleCaptureEra
+        case .missingOrUnreadableAudio: return .missingOrUnreadableAudio
+        case .processingFailed: return .processingFailed
+        case .skipped: return .processingSkipped
+        case .providerTruncated: return .providerTruncated
+        case .excludedUnitIncompleteCoverage: return .excludedUnitIncompleteCoverage
+        }
+    }
+
+    nonisolated static func productCoverageGap(
+        _ gap: MeetingAssemblyCoverageGap
+    ) -> MeetingTranscriptCoverageGap {
+        MeetingTranscriptCoverageGap(
+            trackID: gap.trackID,
+            start: gap.start,
+            end: gap.end,
+            reason: self.productCoverageGapReason(for: gap.reason)
+        )
+    }
+
+    /// Unchanged legacy rule: reuse the open attempt's ID when retrying, otherwise start a new one.
+    private static func resolvedAttemptID(session: MeetingSession) -> UUID {
+        session.processingAttempts.last(where: { $0.completedAt == nil })?.id ?? UUID()
     }
 
     private func processWithLease(
         session: MeetingSession,
         sessionDirectory: URL,
+        attemptID: UUID,
         progress: @escaping @MainActor (MeetingProcessingStage) -> Void
     ) async throws -> MeetingProcessingResult {
         let asrService = self.asrServiceProvider()
@@ -1374,7 +1742,7 @@ final class MeetingProcessingPipeline: MeetingProcessingControlling {
         guard provider.isReady else { throw MeetingProcessingError.modelUnavailable }
 
         var attempt = MeetingProcessingAttempt(
-            id: session.processingAttempts.last(where: { $0.completedAt == nil })?.id ?? UUID(),
+            id: attemptID,
             startedAt: Date(),
             completedAt: nil,
             stage: .identifyingSpeakers,
@@ -1535,7 +1903,7 @@ final class MeetingProcessingPipeline: MeetingProcessingControlling {
     }
 
     private static func loadCheckpoint(sessionDirectory: URL) -> MeetingProcessingCheckpoint? {
-        guard let data = try? Data(contentsOf: Self.checkpointURL(sessionDirectory: sessionDirectory)) else { return nil }
+        guard let data = try? Data(contentsOf: checkpointURL(sessionDirectory: sessionDirectory)) else { return nil }
         return try? Self.checkpointDecoder.decode(MeetingProcessingCheckpoint.self, from: data)
     }
 
@@ -1554,7 +1922,7 @@ final class MeetingProcessingPipeline: MeetingProcessingControlling {
     }
 
     private static func deleteCheckpoint(sessionDirectory: URL) {
-        try? FileManager.default.removeItem(at: Self.checkpointURL(sessionDirectory: sessionDirectory))
+        try? FileManager.default.removeItem(at: self.checkpointURL(sessionDirectory: sessionDirectory))
     }
 
     private func processApplicationTrack(
@@ -1601,7 +1969,9 @@ final class MeetingProcessingPipeline: MeetingProcessingControlling {
     ) {
         guard !pendingTurns.isEmpty else { return }
         var observationsByKey: [String: MeetingGlobalSpeakerStitcher.Observation] = [:]
-        for pending in pendingTurns { observationsByKey[pending.observation.key] = pending.observation }
+        for pending in pendingTurns {
+            observationsByKey[pending.observation.key] = pending.observation
+        }
         let result = MeetingGlobalSpeakerStitcher().stitch(observationsByKey.values.sorted { $0.key < $1.key })
         accumulator.applyGlobalStitch(result, trackKind: .applicationAudio)
 
@@ -2431,7 +2801,7 @@ final class MeetingProcessingPipeline: MeetingProcessingControlling {
     }
 
     nonisolated static func tooManyWordsUnassigned(unassigned: Int, totalWords: Int) -> Bool {
-        totalWords > 0 && Double(unassigned) > Double(totalWords) * Self.maxUnassignedWordFraction
+        totalWords > 0 && Double(unassigned) > Double(totalWords) * self.maxUnassignedWordFraction
     }
 
     private func transcribeTurnsWordAligned(
@@ -2681,7 +3051,7 @@ final class MeetingProcessingPipeline: MeetingProcessingControlling {
         )
     }
 
-    private static func mediaTime(_ seconds: TimeInterval) -> MeetingMediaTime {
+    private nonisolated static func mediaTime(_ seconds: TimeInterval) -> MeetingMediaTime {
         MeetingMediaTime(value: Int64((max(0, seconds) * 1000).rounded()), timescale: 1000)
     }
 

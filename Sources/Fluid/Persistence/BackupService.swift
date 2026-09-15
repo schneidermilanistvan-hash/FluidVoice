@@ -21,6 +21,8 @@ struct SettingsBackupPayload: Codable, Equatable {
     let selectedCohereLanguage: SettingsStore.CohereLanguage
     let selectedNemotronLanguage: SettingsStore.NemotronLanguage?
     let selectedAppleSpeechLocaleIdentifier: String?
+    /// Stable final-meeting backend ID. Optional so backups from before backend selection decode.
+    let meetingTranscriptionBackendID: String?
     let hotkeyShortcut: HotkeyShortcut
     // Older backup files only contain hotkeyShortcut; nil restores that legacy single shortcut.
     // swiftlint:disable:next discouraged_optional_collection

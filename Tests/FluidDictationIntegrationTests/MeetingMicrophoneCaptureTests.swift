@@ -352,6 +352,34 @@ final class MeetingMicrophoneCaptureTests: XCTestCase {
         XCTAssertEqual(track.chunks.first?.discontinuities ?? [], [])
     }
 
+    func testWriterPublishesPCMCAFMetadataAndReadyLedgerTerminal() async throws {
+        let (writer, sessionDirectory) = try self.makeWriter()
+        defer { try? FileManager.default.removeItem(at: sessionDirectory) }
+
+        self.pushBuffer(writer, ptsSeconds: 0, frameCount: 480)
+        let track = await writer.stop()
+
+        let chunk = try XCTUnwrap(track.chunks.first)
+        XCTAssertEqual(track.format, MeetingAudioFormat(codec: "lpcm-f32", sampleRate: 48_000, channelCount: 1, bitRate: nil))
+        XCTAssertTrue(chunk.relativeFilePath.hasSuffix(".caf"))
+        XCTAssertFalse(chunk.relativeFilePath.hasSuffix(".m4a"))
+        XCTAssertEqual(chunk.finalizationState, .finalized)
+        XCTAssertEqual(chunk.audioSchemaVersion, 2)
+        let asset = try XCTUnwrap(chunk.captureAnalysisAsset)
+        XCTAssertEqual(asset.encoding, .linearPCMFloat32CAFV1)
+        XCTAssertEqual(asset.presence, .ready)
+        XCTAssertEqual(asset.frameCount, 480)
+        XCTAssertNil(chunk.playbackArchiveAsset)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sessionDirectory.appendingPathComponent(chunk.relativeFilePath).path))
+        let audioFiles = try FileManager.default.subpathsOfDirectory(atPath: sessionDirectory.path)
+            .filter { $0.hasSuffix(".m4a") }
+        XCTAssertTrue(audioFiles.isEmpty)
+
+        let ledger = MeetingAudioChunkLedgerStore(sessionDirectory: sessionDirectory)
+        XCTAssertEqual(try ledger.readTerminal(for: chunk.id)?.status, .ready)
+        XCTAssertEqual(try ledger.readCheckpoint(for: chunk.id)?.writtenFrames, 480)
+    }
+
     func testOneTickOverlapTriggersClockDiscontinuityAndRotation() async throws {
         let (writer, sessionDirectory) = try self.makeWriter()
         defer { try? FileManager.default.removeItem(at: sessionDirectory) }
